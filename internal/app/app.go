@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"sync"
 
@@ -119,6 +120,21 @@ func googleCallbackHandler(c *gin.Context) {
 		return
 	}
 
+	// ---- Upsert user into database ----
+	if dbPool != nil {
+		query := `
+			INSERT INTO users (google_id, email, name, avatar, last_login)
+			VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
+			ON CONFLICT (google_id) DO UPDATE 
+			SET name = $3, avatar = $4, last_login = CURRENT_TIMESTAMP
+		`
+		_, err := dbPool.Exec(context.Background(), query, userInfo.Id, userInfo.Email, userInfo.Name, userInfo.Picture)
+		if err != nil {
+			log.Printf("Failed to upsert user: %v\n", err)
+			// We continue even if DB fails for now, or you can choose to return error
+		}
+	}
+
 	// Generate our own JWT
 	token, err := auth.GenerateJWT(userInfo.Id, userInfo.Email, userInfo.Name)
 	if err != nil {
@@ -127,16 +143,19 @@ func googleCallbackHandler(c *gin.Context) {
 	}
 
 	// Redirect back to frontend with token
-	// In production, FRONTEND_URL should be set (e.g. https://your-app.vercel.app)
 	frontendURL := os.Getenv("FRONTEND_URL")
 	if frontendURL == "" {
-		frontendURL = "http://localhost:5173" // Default Vite dev port
+		frontendURL = "http://localhost:5173"
 	}
 
-	// We pass the info via URL fragment (#) so it doesn't stay in browser history as much
-	// and frontend can easily parse it.
+	// Properly encode user info for URL
 	redirectURL := fmt.Sprintf("%s/login?token=%s&name=%s&email=%s&avatar=%s",
-		frontendURL, token, userInfo.Name, userInfo.Email, userInfo.Picture)
+		frontendURL,
+		token,
+		url.QueryEscape(userInfo.Name),
+		url.QueryEscape(userInfo.Email),
+		url.QueryEscape(userInfo.Picture),
+	)
 
 	c.Redirect(http.StatusTemporaryRedirect, redirectURL)
 }

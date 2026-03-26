@@ -98,85 +98,101 @@ func pushSyncHandler(c *gin.Context) {
 	var userID string
 	err = tx.QueryRow(ctx, "SELECT id FROM users WHERE google_id = $1", googleID).Scan(&userID)
 	if err != nil {
+		log.Printf("[Sync] User lookup failed for google_id %s: %v\n", googleID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "User not found in DB"})
 		return
 	}
 
 	// 1. Clear existing data for this user
-	// Note: cascades will handle records linked to books, but we need to clear personal records and templates too.
-	_, _ = tx.Exec(ctx, "DELETE FROM books WHERE user_id = $1", userID)
-	_, _ = tx.Exec(ctx, "DELETE FROM personal_records WHERE user_id = $1", userID)
-	_, _ = tx.Exec(ctx, "DELETE FROM record_templates WHERE user_id = $1", userID)
-	_, _ = tx.Exec(ctx, "DELETE FROM categories WHERE user_id = $1", userID)
+	// We delete books first, cascade will handle book_members and records
+	if _, err := tx.Exec(ctx, "DELETE FROM books WHERE user_id = $1", userID); err != nil {
+		log.Printf("[Sync] Failed to clear books: %v\n", err)
+	}
+	if _, err := tx.Exec(ctx, "DELETE FROM personal_records WHERE user_id = $1", userID); err != nil {
+		log.Printf("[Sync] Failed to clear personal_records: %v\n", err)
+	}
+	if _, err := tx.Exec(ctx, "DELETE FROM record_templates WHERE user_id = $1", userID); err != nil {
+		log.Printf("[Sync] Failed to clear templates: %v\n", err)
+	}
+	if _, err := tx.Exec(ctx, "DELETE FROM categories WHERE user_id = $1", userID); err != nil {
+		log.Printf("[Sync] Failed to clear categories: %v\n", err)
+	}
 
 	// 2. Insert new state
 	// Insert Categories
 	for _, cat := range data.Categories {
-		_, err = tx.Exec(ctx,
+		_, err = tx.Exec(ctx, 
 			"INSERT INTO categories (id, user_id, name, type, icon, color, is_default) VALUES ($1, $2, $3, $4, $5, $6, $7)",
 			cat.ID, userID, cat.Name, cat.Type, cat.Icon, cat.Color, cat.IsDefault)
-		if err != nil {
+		if err != nil { 
+			log.Printf("[Sync] Category insert error: %v\n", err)
 			insertError(c, "categories", err)
-			return
+			return 
 		}
-		}
+	}
 
-		// Insert Books & Members
-		for _, book := range data.Books {
+	// Insert Books & Members
+	for _, book := range data.Books {
 		_, err = tx.Exec(ctx, "INSERT INTO books (id, user_id, name, created_at) VALUES ($1, $2, $3, $4)",
 			book.ID, userID, book.Name, book.CreatedAt)
-		if err != nil {
+		if err != nil { 
+			log.Printf("[Sync] Book insert error: %v\n", err)
 			insertError(c, "books", err)
-			return
+			return 
 		}
 
 		for _, m := range book.Members {
 			_, err = tx.Exec(ctx, "INSERT INTO book_members (id, book_id, name) VALUES ($1, $2, $3)",
 				m.ID, book.ID, m.Name)
-			if err != nil {
+			if err != nil { 
+				log.Printf("[Sync] Member insert error: %v\n", err)
 				insertError(c, "book_members", err)
-				return
+				return 
 			}
 		}
-		}
+	}
 
-		// Insert Shared Records
-		for _, rec := range data.Records {
+	// Insert Shared Records
+	for _, rec := range data.Records {
 		_, err = tx.Exec(ctx, 
 			"INSERT INTO records (id, book_id, type, amount, category, date, note, paid_by_id, split_among_ids) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
 			rec.ID, rec.BookID, rec.Type, rec.Amount, rec.Category, rec.Date, rec.Note, rec.PaidByID, rec.SplitAmongIds)
-		if err != nil {
+		if err != nil { 
+			log.Printf("[Sync] Record insert error: %v\n", err)
 			insertError(c, "records", err)
-			return
+			return 
 		}
-		}
+	}
 
-		// Insert Personal Records
-		for _, rec := range data.PersonalRecords {
+	// Insert Personal Records
+	for _, rec := range data.PersonalRecords {
 		var sourceBookID *string
 		if rec.SourceBookID != "" { sourceBookID = &rec.SourceBookID }
 		_, err = tx.Exec(ctx, 
 			"INSERT INTO personal_records (id, user_id, type, amount, category, date, note, source_book_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
 			rec.ID, userID, rec.Type, rec.Amount, rec.Category, rec.Date, rec.Note, sourceBookID)
-		if err != nil {
+		if err != nil { 
+			log.Printf("[Sync] Personal record insert error: %v\n", err)
 			insertError(c, "personal_records", err)
-			return
+			return 
 		}
-		}
+	}
 
-		// Insert Templates
-		for _, tpl := range data.Templates {
+	// Insert Templates
+	for _, tpl := range data.Templates {
 		_, err = tx.Exec(ctx, 
 			"INSERT INTO record_templates (id, user_id, name, type, amount, category, note) VALUES ($1, $2, $3, $4, $5, $6, $7)",
 			tpl.ID, userID, tpl.Name, tpl.Type, tpl.Amount, tpl.Category, tpl.Note)
-		if err != nil {
+		if err != nil { 
+			log.Printf("[Sync] Template insert error: %v\n", err)
 			insertError(c, "templates", err)
-			return
+			return 
 		}
-		}
+	}
 
 	err = tx.Commit(ctx)
 	if err != nil {
+		log.Printf("[Sync] Transaction commit error: %v\n", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to commit transaction"})
 		return
 	}

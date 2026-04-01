@@ -377,8 +377,17 @@ func pushSyncByUUIDHandler(c *gin.Context) {
 
 	// Ensure user exists or create anonymous
 	var userID string
-	err := dbPool.QueryRow(ctx, "SELECT id FROM users WHERE id = $1", wrapper.UUID).Scan(&userID)
-	if err != nil {
+	var googleID *string
+	err := dbPool.QueryRow(ctx, "SELECT id, google_id FROM users WHERE id = $1", wrapper.UUID).Scan(&userID, &googleID)
+	
+	if err == nil {
+		// User exists. If they have a Google ID, they must use authenticated sync.
+		if googleID != nil {
+			c.JSON(http.StatusForbidden, gin.H{"error": "This account is linked to Google. Please login to sync."})
+			return
+		}
+		// Existing anonymous user
+	} else {
 		// Create anonymous user
 		_, err = dbPool.Exec(ctx, "INSERT INTO users (id, name, email) VALUES ($1, $2, $3)", wrapper.UUID, "Anonymous", wrapper.UUID+"@anonymous.local")
 		if err != nil {

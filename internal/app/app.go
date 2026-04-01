@@ -63,22 +63,10 @@ func initDB() {
 }
 
 func setupRouter() {
-	gin.SetMode(gin.ReleaseMode)
 	r := gin.Default()
 
 	// CORS Middleware
-	r.Use(func(c *gin.Context) {
-		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
-		c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
-		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, accept, origin, Cache-Control, X-Requested-With")
-		c.Writer.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS, GET, PUT, DELETE")
-
-		if c.Request.Method == "OPTIONS" {
-			c.AbortWithStatus(204)
-			return
-		}
-		c.Next()
-	})
+	r.Use(middleware.CORS())
 
 	r.GET("/ping", func(c *gin.Context) {
 		dbStatus := "connected"
@@ -117,9 +105,9 @@ func setupRouter() {
 		// Public Shared Spaces (Option 2)
 		sharedGrp := api.Group("/shared")
 		{
-			sharedGrp.POST("/share", shareBookHandler)           // Create a new share code
-			sharedGrp.GET("/:code", getSharedBookHandler)        // Fetch book by code
-			sharedGrp.PUT("/:code", updateSharedBookHandler)     // Update book by code
+			sharedGrp.POST("/share", shareBookHandler)       // Create a new share code
+			sharedGrp.GET("/:code", getSharedBookHandler)    // Fetch book by code
+			sharedGrp.PUT("/:code", updateSharedBookHandler) // Update book by code
 		}
 	}
 

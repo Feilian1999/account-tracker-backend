@@ -59,11 +59,17 @@ JWT_SECRET=your_jwt_signing_secret
 
 ### Running Locally
 
+**Debug mode (local dev):**
 To start the Gin development server on the default port:
-
 ```bash
-go run main.go
+GIN_MODE=debug go run main.go
 ```
+
+**Release mode:**
+```bash
+GIN_MODE=release go run main.go
+```
+
 The server will be reachable at `http://localhost:8080` (or whichever port specified in `.env`).
 
 *On application start, the server will ping the configured database and automatically run any necessary migrations.*

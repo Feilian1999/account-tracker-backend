@@ -227,6 +227,10 @@ func pushSyncHandler(c *gin.Context) {
 
 	// Insert Shared Records
 	for _, rec := range data.Records {
+		var paidByID *string
+		if rec.PaidByID != "" {
+			paidByID = &rec.PaidByID
+		}
 		date := normalizeDate(rec.Date)
 		_, err = tx.Exec(ctx, `
 			INSERT INTO records (id, book_id, type, amount, category, date, note, paid_by_id, split_among_ids) 
@@ -239,7 +243,7 @@ func pushSyncHandler(c *gin.Context) {
 				note = EXCLUDED.note,
 				paid_by_id = EXCLUDED.paid_by_id,
 				split_among_ids = EXCLUDED.split_among_ids
-		`, rec.ID, rec.BookID, rec.Type, rec.Amount, rec.Category, date, rec.Note, rec.PaidByID, rec.SplitAmongIds)
+		`, rec.ID, rec.BookID, rec.Type, rec.Amount, rec.Category, date, rec.Note, paidByID, rec.SplitAmongIds)
 		if err != nil {
 			log.Printf("[Sync] Record insert error: %v\n", err)
 			insertError(c, "records", err)
@@ -520,6 +524,10 @@ func pushSyncByUUIDHandler(c *gin.Context) {
 
 	// Shared Records
 	for _, rec := range wrapper.Records {
+		var paidByID *string
+		if rec.PaidByID != "" {
+			paidByID = &rec.PaidByID
+		}
 		date := normalizeDate(rec.Date)
 		_, err = tx.Exec(ctx, `
 			INSERT INTO records (id, book_id, type, amount, category, date, note, paid_by_id, split_among_ids) 
@@ -532,7 +540,7 @@ func pushSyncByUUIDHandler(c *gin.Context) {
 				note = EXCLUDED.note,
 				paid_by_id = EXCLUDED.paid_by_id,
 				split_among_ids = EXCLUDED.split_among_ids
-		`, rec.ID, rec.BookID, rec.Type, rec.Amount, rec.Category, date, rec.Note, rec.PaidByID, rec.SplitAmongIds)
+		`, rec.ID, rec.BookID, rec.Type, rec.Amount, rec.Category, date, rec.Note, paidByID, rec.SplitAmongIds)
 		if err != nil {
 			insertError(c, "records", err)
 			return

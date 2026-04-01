@@ -439,6 +439,7 @@ func pushSyncByUUIDHandler(c *gin.Context) {
 			ON CONFLICT (id) DO UPDATE SET 
 				name = EXCLUDED.name,
 				created_at = EXCLUDED.created_at
+			WHERE books.user_id = $2
 		`, book.ID, userID, book.Name, createdAt)
 		if err != nil {
 			insertError(c, "books", err)

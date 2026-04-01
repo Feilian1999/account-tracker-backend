@@ -160,6 +160,7 @@ func googleCallbackHandler(c *gin.Context) {
 	}
 
 	// ---- Upsert user into database ----
+	var internalID string
 	if dbPool != nil {
 		query := `
 			INSERT INTO users (google_id, email, name, avatar_url)
@@ -168,10 +169,13 @@ func googleCallbackHandler(c *gin.Context) {
 			SET name = EXCLUDED.name, 
 			    avatar_url = EXCLUDED.avatar_url, 
 			    email = EXCLUDED.email
+			RETURNING id
 		`
-		_, err := dbPool.Exec(context.Background(), query, userInfo.Id, userInfo.Email, userInfo.Name, userInfo.Picture)
+		err := dbPool.QueryRow(context.Background(), query, userInfo.Id, userInfo.Email, userInfo.Name, userInfo.Picture).Scan(&internalID)
 		if err != nil {
 			log.Printf("Failed to upsert user: %v\n", err)
+			// Fallback: search by google_id if scan failed for some reason
+			dbPool.QueryRow(context.Background(), "SELECT id FROM users WHERE google_id = $1", userInfo.Id).Scan(&internalID)
 		}
 	}
 
@@ -189,9 +193,10 @@ func googleCallbackHandler(c *gin.Context) {
 	}
 
 	// Properly encode user info for URL
-	redirectURL := fmt.Sprintf("%s/login?token=%s&name=%s&email=%s&avatar=%s",
+	redirectURL := fmt.Sprintf("%s/login?token=%s&id=%s&name=%s&email=%s&avatar=%s",
 		frontendURL,
 		token,
+		internalID,
 		url.QueryEscape(userInfo.Name),
 		url.QueryEscape(userInfo.Email),
 		url.QueryEscape(userInfo.Picture),

@@ -421,9 +421,16 @@ func pushSyncByUUIDHandler(c *gin.Context) {
 
 	// Insert Categories
 	for _, cat := range wrapper.Categories {
-		_, err = tx.Exec(ctx,
-			"INSERT INTO categories (id, user_id, name, type, icon, color, is_default) VALUES ($1, $2, $3, $4, $5, $6, $7)",
-			cat.ID, userID, cat.Name, cat.Type, cat.Icon, cat.Color, cat.IsDefault)
+		_, err = tx.Exec(ctx, `
+			INSERT INTO categories (id, user_id, name, type, icon, color, is_default) 
+			VALUES ($1, $2, $3, $4, $5, $6, $7)
+			ON CONFLICT (id) DO UPDATE SET
+				name = EXCLUDED.name,
+				type = EXCLUDED.type,
+				icon = EXCLUDED.icon,
+				color = EXCLUDED.color,
+				is_default = EXCLUDED.is_default
+		`, cat.ID, userID, cat.Name, cat.Type, cat.Icon, cat.Color, cat.IsDefault)
 		if err != nil {
 			insertError(c, "categories", err)
 			return
@@ -489,9 +496,17 @@ func pushSyncByUUIDHandler(c *gin.Context) {
 			sourceBookID = &rec.SourceBookID
 		}
 		date := normalizeDate(rec.Date)
-		_, err = tx.Exec(ctx,
-			"INSERT INTO personal_records (id, user_id, type, amount, category, date, note, source_book_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-			rec.ID, userID, rec.Type, rec.Amount, rec.Category, date, rec.Note, sourceBookID)
+		_, err = tx.Exec(ctx, `
+			INSERT INTO personal_records (id, user_id, type, amount, category, date, note, source_book_id) 
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			ON CONFLICT (id) DO UPDATE SET
+				type = EXCLUDED.type,
+				amount = EXCLUDED.amount,
+				category = EXCLUDED.category,
+				date = EXCLUDED.date,
+				note = EXCLUDED.note,
+				source_book_id = EXCLUDED.source_book_id
+		`, rec.ID, userID, rec.Type, rec.Amount, rec.Category, date, rec.Note, sourceBookID)
 		if err != nil {
 			insertError(c, "personal_records", err)
 			return
@@ -500,9 +515,16 @@ func pushSyncByUUIDHandler(c *gin.Context) {
 
 	// Templates
 	for _, tpl := range wrapper.Templates {
-		_, err = tx.Exec(ctx,
-			"INSERT INTO record_templates (id, user_id, name, type, amount, category, note) VALUES ($1, $2, $3, $4, $5, $6, $7)",
-			tpl.ID, userID, tpl.Name, tpl.Type, tpl.Amount, tpl.Category, tpl.Note)
+		_, err = tx.Exec(ctx, `
+			INSERT INTO record_templates (id, user_id, name, type, amount, category, note) 
+			VALUES ($1, $2, $3, $4, $5, $6, $7)
+			ON CONFLICT (id) DO UPDATE SET
+				name = EXCLUDED.name,
+				type = EXCLUDED.type,
+				amount = EXCLUDED.amount,
+				category = EXCLUDED.category,
+				note = EXCLUDED.note
+		`, tpl.ID, userID, tpl.Name, tpl.Type, tpl.Amount, tpl.Category, tpl.Note)
 		if err != nil {
 			insertError(c, "templates", err)
 			return

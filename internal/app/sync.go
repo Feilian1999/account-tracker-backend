@@ -153,8 +153,13 @@ func pushSyncHandler(c *gin.Context) {
 		return
 	}
 
-	// 1. Clear existing data for this user
-	// We delete books first, cascade will handle book_members and records
+	// 1. Clear existing data — delete child tables first to avoid FK cascade
+	if _, err := tx.Exec(ctx, "DELETE FROM records WHERE book_id IN (SELECT id FROM books WHERE user_id = $1)", userID); err != nil {
+		log.Printf("[Sync] Failed to clear records: %v\n", err)
+	}
+	if _, err := tx.Exec(ctx, "DELETE FROM book_members WHERE book_id IN (SELECT id FROM books WHERE user_id = $1)", userID); err != nil {
+		log.Printf("[Sync] Failed to clear book_members: %v\n", err)
+	}
 	if _, err := tx.Exec(ctx, "DELETE FROM books WHERE user_id = $1", userID); err != nil {
 		log.Printf("[Sync] Failed to clear books: %v\n", err)
 	}
@@ -171,9 +176,16 @@ func pushSyncHandler(c *gin.Context) {
 	// 2. Insert new state
 	// Insert Categories
 	for _, cat := range data.Categories {
-		_, err = tx.Exec(ctx,
-			"INSERT INTO categories (id, user_id, name, type, icon, color, is_default) VALUES ($1, $2, $3, $4, $5, $6, $7)",
-			cat.ID, userID, cat.Name, cat.Type, cat.Icon, cat.Color, cat.IsDefault)
+		_, err = tx.Exec(ctx, `
+			INSERT INTO categories (id, user_id, name, type, icon, color, is_default) 
+			VALUES ($1, $2, $3, $4, $5, $6, $7)
+			ON CONFLICT (id) DO UPDATE SET
+				name = EXCLUDED.name,
+				type = EXCLUDED.type,
+				icon = EXCLUDED.icon,
+				color = EXCLUDED.color,
+				is_default = EXCLUDED.is_default
+		`, cat.ID, userID, cat.Name, cat.Type, cat.Icon, cat.Color, cat.IsDefault)
 		if err != nil {
 			log.Printf("[Sync] Category insert error: %v\n", err)
 			insertError(c, "categories", err)
@@ -184,8 +196,13 @@ func pushSyncHandler(c *gin.Context) {
 	// Insert Books & Members
 	for _, book := range data.Books {
 		createdAt := normalizeTimestamp(book.CreatedAt)
-		_, err = tx.Exec(ctx, "INSERT INTO books (id, user_id, name, created_at) VALUES ($1, $2, $3, $4)",
-			book.ID, userID, book.Name, createdAt)
+		_, err = tx.Exec(ctx, `
+			INSERT INTO books (id, user_id, name, created_at) 
+			VALUES ($1, $2, $3, $4)
+			ON CONFLICT (id) DO UPDATE SET 
+				name = EXCLUDED.name,
+				created_at = EXCLUDED.created_at
+		`, book.ID, userID, book.Name, createdAt)
 		if err != nil {
 			log.Printf("[Sync] Book insert error: %v\n", err)
 			insertError(c, "books", err)
@@ -193,8 +210,13 @@ func pushSyncHandler(c *gin.Context) {
 		}
 
 		for _, m := range book.Members {
-			_, err = tx.Exec(ctx, "INSERT INTO book_members (id, book_id, name) VALUES ($1, $2, $3)",
-				m.ID, book.ID, m.Name)
+			_, err = tx.Exec(ctx, `
+				INSERT INTO book_members (id, book_id, name) 
+				VALUES ($1, $2, $3)
+				ON CONFLICT (id) DO UPDATE SET
+					name = EXCLUDED.name,
+					book_id = EXCLUDED.book_id
+			`, m.ID, book.ID, m.Name)
 			if err != nil {
 				log.Printf("[Sync] Member insert error: %v\n", err)
 				insertError(c, "book_members", err)
@@ -206,9 +228,18 @@ func pushSyncHandler(c *gin.Context) {
 	// Insert Shared Records
 	for _, rec := range data.Records {
 		date := normalizeDate(rec.Date)
-		_, err = tx.Exec(ctx,
-			"INSERT INTO records (id, book_id, type, amount, category, date, note, paid_by_id, split_among_ids) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
-			rec.ID, rec.BookID, rec.Type, rec.Amount, rec.Category, date, rec.Note, rec.PaidByID, rec.SplitAmongIds)
+		_, err = tx.Exec(ctx, `
+			INSERT INTO records (id, book_id, type, amount, category, date, note, paid_by_id, split_among_ids) 
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+			ON CONFLICT (id) DO UPDATE SET
+				type = EXCLUDED.type,
+				amount = EXCLUDED.amount,
+				category = EXCLUDED.category,
+				date = EXCLUDED.date,
+				note = EXCLUDED.note,
+				paid_by_id = EXCLUDED.paid_by_id,
+				split_among_ids = EXCLUDED.split_among_ids
+		`, rec.ID, rec.BookID, rec.Type, rec.Amount, rec.Category, date, rec.Note, rec.PaidByID, rec.SplitAmongIds)
 		if err != nil {
 			log.Printf("[Sync] Record insert error: %v\n", err)
 			insertError(c, "records", err)
@@ -223,9 +254,17 @@ func pushSyncHandler(c *gin.Context) {
 			sourceBookID = &rec.SourceBookID
 		}
 		date := normalizeDate(rec.Date)
-		_, err = tx.Exec(ctx,
-			"INSERT INTO personal_records (id, user_id, type, amount, category, date, note, source_book_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-			rec.ID, userID, rec.Type, rec.Amount, rec.Category, date, rec.Note, sourceBookID)
+		_, err = tx.Exec(ctx, `
+			INSERT INTO personal_records (id, user_id, type, amount, category, date, note, source_book_id) 
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			ON CONFLICT (id) DO UPDATE SET
+				type = EXCLUDED.type,
+				amount = EXCLUDED.amount,
+				category = EXCLUDED.category,
+				date = EXCLUDED.date,
+				note = EXCLUDED.note,
+				source_book_id = EXCLUDED.source_book_id
+		`, rec.ID, userID, rec.Type, rec.Amount, rec.Category, date, rec.Note, sourceBookID)
 		if err != nil {
 			log.Printf("[Sync] Personal record insert error: %v\n", err)
 			insertError(c, "personal_records", err)
@@ -235,9 +274,16 @@ func pushSyncHandler(c *gin.Context) {
 
 	// Insert Templates
 	for _, tpl := range data.Templates {
-		_, err = tx.Exec(ctx,
-			"INSERT INTO record_templates (id, user_id, name, type, amount, category, note) VALUES ($1, $2, $3, $4, $5, $6, $7)",
-			tpl.ID, userID, tpl.Name, tpl.Type, tpl.Amount, tpl.Category, tpl.Note)
+		_, err = tx.Exec(ctx, `
+			INSERT INTO record_templates (id, user_id, name, type, amount, category, note) 
+			VALUES ($1, $2, $3, $4, $5, $6, $7)
+			ON CONFLICT (id) DO UPDATE SET
+				name = EXCLUDED.name,
+				type = EXCLUDED.type,
+				amount = EXCLUDED.amount,
+				category = EXCLUDED.category,
+				note = EXCLUDED.note
+		`, tpl.ID, userID, tpl.Name, tpl.Type, tpl.Amount, tpl.Category, tpl.Note)
 		if err != nil {
 			log.Printf("[Sync] Template insert error: %v\n", err)
 			insertError(c, "templates", err)

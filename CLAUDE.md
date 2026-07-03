@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Framework**: Gin v1.12
 - **Database**: PostgreSQL (Neon DB) via pgx v5
 - **Migrations**: golang-migrate v4 (auto-runs on startup)
-- **Auth**: Google OAuth2 + JWT (`golang-jwt/jwt v5`)
+- **Auth**: None. No accounts/login. Cloud backup is keyed by a secret client UUID; shared books by a share code.
 - **Deploy**: Vercel serverless (`api/index.go`) or standalone (`main.go`)
 
 ## Commands
@@ -28,19 +28,16 @@ account-tracker-backend/
 │   └── index.go                     # Vercel serverless entry: Handler(w, r) → app.GetRouter().ServeHTTP()
 ├── internal/
 │   ├── app/
-│   │   ├── app.go                   # Router init (once.Do), DB init, CORS, all route registration
-│   │   ├── sync.go                  # pushSyncHandler, pullSyncHandler, pushSyncByUUIDHandler, pullSyncByUUIDHandler
-│   │   └── share.go                 # shareBookHandler, getSharedBookHandler, updateSharedBookHandler
-│   ├── auth/
-│   │   ├── google.go                # GetGoogleLoginURL, GetGoogleUserInfo (OAuth2 flow)
-│   │   └── jwt.go                   # GenerateJWT, ParseJWT (claims: google_id, email, name)
+│   │   ├── app.go                   # Router init (once.Do), DB init (pool sizing), CORS, route registration
+│   │   ├── sync.go                  # pushSyncByUUIDHandler, pullSyncByUUIDHandler (UUID cloud backup)
+│   │   └── share.go                 # shareBookHandler, getSharedBookHandler, updateSharedBookHandler (merge)
 │   ├── db/
-│   │   ├── migrate.go               # RunMigrations(dbURL) — auto-runs on app init
+│   │   ├── migrate.go               # RunMigrations(dbURL) — auto-runs on app init, closes its own conn
 │   │   └── migrations/
 │   │       ├── 000001_init_schema.up.sql    # Core tables
 │   │       └── 000002_shared_spaces.up.sql  # shared_spaces table
 │   └── middleware/
-│       └── auth_middleware.go        # JWT validation → sets "user_google_id" in Gin context
+│       └── cors.go                   # CORS allowlist (web + Capacitor origins; CORS_ORIGINS env for extras)
 └── .env / .env.example              # Environment config
 ```
 
@@ -49,11 +46,7 @@ account-tracker-backend/
 ```env
 PORT=8080
 DATABASE_URL=postgresql://user:pass@host/dbname
-FRONTEND_URL=http://localhost:5173     # OAuth callback redirect target
-GOOGLE_CLIENT_ID=...
-GOOGLE_CLIENT_SECRET=...
-GOOGLE_REDIRECT_URI=http://localhost:8080/api/auth/google/callback
-JWT_SECRET=...
+CORS_ORIGINS=https://example.com   # optional, extra comma-separated allowed origins
 ```
 
 ## API Routes
@@ -61,19 +54,17 @@ JWT_SECRET=...
 ```
 GET  /ping                         # healthcheck → {message, db}
 
-GET  /api/auth/google/login        # redirect to Google OAuth consent
-GET  /api/auth/google/callback     # receive code → upsert user → JWT → redirect to FRONTEND_URL/login?token=...&id=...&name=...&email=...&avatar=...
-
-POST /api/sync/push-uuid           # public, body: {uuid, books, records, ...}
-GET  /api/sync/pull-uuid/:uuid     # public
-
-POST /api/sync/push                # JWT required — full replace of user's data
-GET  /api/sync/pull                # JWT required — return all user's data
+POST /api/sync/push-uuid           # body: {uuid, books, records, ...} — full replace of that UUID's data
+GET  /api/sync/pull-uuid/:uuid     # return all of that UUID's data (500 on DB error, never partial)
 
 POST /api/shared/share             # create share code → stores full payload as JSONB
-GET  /api/shared/:code             # fetch payload by 6-char code
-PUT  /api/shared/:code             # overwrite payload by code
+GET  /api/shared/:code             # fetch payload by code
+PUT  /api/shared/:code             # MERGE payload by code (records by id + deletedIds; members unioned)
 ```
+
+The UUID sync endpoints are unauthenticated by design: the client UUID is a secret,
+unguessable capability token (v4 UUID). It must never be exposed — in particular it is
+NOT the id embedded in shared-book member lists (the frontend uses a separate `memberId`).
 
 ## Database Schema
 
@@ -93,30 +84,25 @@ PUT  /api/shared/:code             # overwrite payload by code
 
 | Table | Key columns |
 |-------|-------------|
-| `shared_spaces` | `code TEXT PK` (6-char), `payload JSONB` (full book+records snapshot), `updated_at` |
+| `shared_spaces` | `code TEXT PK` (8-char, older 6-char still valid), `payload JSONB` (full book+records snapshot), `updated_at` |
 
-`shared_spaces.payload` is an opaque JSONB blob — the backend does not inspect its structure. The frontend owns the schema.
+`shared_spaces.payload` stores `{book, records}`. `updateSharedBookHandler` parses it to merge (see Key Patterns); `share`/`get` treat it as an opaque blob. The frontend owns the schema.
 
 ## Key Patterns
 
-### Sync model (push/pull)
-Push = **full replace**: DELETE all user's rows across all tables → INSERT everything from request body. No partial updates. This means the frontend is always the source of truth when pushing.
+### UUID sync model (push/pull)
+Push = **full replace** inside one transaction: DELETE all the UUID's rows → INSERT everything from the request body. A failed DELETE or INSERT aborts the whole push (no partial commit). Inserts of books/members/records are guarded so a payload can only write into books owned by that UUID. The frontend is the source of truth when pushing.
 
-Pull = SELECT all rows for this user, return as structured JSON.
+Pull = SELECT all rows for this UUID. Any DB error returns 500 (never a partial/empty 200) so the client cannot mistake a failure for "cloud is empty" and wipe local data on the next push.
 
 ### Anonymous users
-UUID-based sync creates a `users` row with `id = uuid` and `email = uuid@anonymous.local`. This allows the same push/pull flow without Google auth.
+UUID-based sync creates a `users` row with `id = uuid` and `email = uuid@anonymous.local` (inside the push transaction). `users.google_id` / `avatar_url` columns still exist in the schema but are unused.
+
+### Shared-book merge
+`updateSharedBookHandler` MERGES the pusher's snapshot into the stored payload instead of overwriting it: records are unioned by id (incoming wins), ids listed in the request's `deletedIds` are removed, and book members are unioned by id. This prevents two members editing concurrently from clobbering each other. Share codes are 8 chars (older 6-char codes still resolve).
 
 ### Router singleton
-`GetRouter()` uses `sync.Once` — safe for both Vercel (cold start per request) and standalone (persistent process).
-
-### OAuth flow
-`googleCallbackHandler` → upserts user → generates JWT with `google_id` as subject → redirects to `FRONTEND_URL/login?token=...&id=<internal_user_id>&...`
-
-JWT middleware extracts `google_id` → push/pull handlers look up `users.id` from `google_id` internally.
+`GetRouter()` uses `sync.Once` — safe for both Vercel (cold start per request) and standalone (persistent process). The pgx pool is capped (`MaxConns=2`) for serverless; migrations close their own connection.
 
 ### `isSynced` field (frontend-only)
 The frontend sends `isSynced` on record objects; Go's JSON decoder ignores unknown fields, so no backend changes are needed for this field.
-
-### Stub handlers
-`registerHandler`, `loginHandler`, `getRecordsHandler`, `syncRecordsHandler` in `app.go` are stubs from early development — not used by the frontend.

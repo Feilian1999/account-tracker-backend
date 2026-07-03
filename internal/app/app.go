@@ -2,15 +2,12 @@ package app
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"net/http"
-	"net/url"
 	"os"
 	"strings"
 	"sync"
 
-	"github.com/feilian1999/account-tracker-backend/internal/auth"
 	"github.com/feilian1999/account-tracker-backend/internal/db"
 	"github.com/feilian1999/account-tracker-backend/internal/middleware"
 	"github.com/gin-gonic/gin"
@@ -35,8 +32,16 @@ func initDB() {
 		return
 	}
 
-	var err error
-	dbPool, err = pgxpool.New(context.Background(), dbURL)
+	cfg, err := pgxpool.ParseConfig(dbURL)
+	if err != nil {
+		log.Printf("Unable to parse database URL: %v\n", err)
+		return
+	}
+	// Keep the pool tiny: on Vercel each serverless instance owns its own pool,
+	// so a large MaxConns across many concurrent instances exhausts Neon's limit.
+	cfg.MaxConns = 2
+
+	dbPool, err = pgxpool.NewWithConfig(context.Background(), cfg)
 	if err != nil {
 		log.Printf("Unable to connect to database: %v\n", err)
 		return
@@ -78,36 +83,21 @@ func setupRouter() {
 
 	api := r.Group("/api")
 	{
-		api.GET("/auth/google/login", googleLoginHandler)
-		api.GET("/auth/google/callback", googleCallbackHandler)
-
-		api.POST("/auth/register", registerHandler)
-		api.POST("/auth/login", loginHandler)
-		api.GET("/records", getRecordsHandler)
-		api.POST("/records/sync", syncRecordsHandler)
-
-		// Sync endpoints
+		// Cloud backup/restore, identified by the user's secret local UUID.
+		// The UUID is an unguessable capability token — it must never be exposed
+		// publicly (it is not embedded in shared-book payloads; see frontend memberId).
 		syncGrp := api.Group("/sync")
 		{
-			// Public UUID-based sync
 			syncGrp.POST("/push-uuid", pushSyncByUUIDHandler)
 			syncGrp.GET("/pull-uuid/:uuid", pullSyncByUUIDHandler)
-
-			// Protected by JWT
-			syncAuthGrp := syncGrp.Group("/")
-			syncAuthGrp.Use(middleware.AuthMiddleware())
-			{
-				syncAuthGrp.POST("/push", pushSyncHandler)
-				syncAuthGrp.GET("/pull", pullSyncHandler)
-			}
 		}
 
-		// Public Shared Spaces (Option 2)
+		// Public Shared Spaces — collaborative books identified by a 6-char code.
 		sharedGrp := api.Group("/shared")
 		{
 			sharedGrp.POST("/share", shareBookHandler)       // Create a new share code
 			sharedGrp.GET("/:code", getSharedBookHandler)    // Fetch book by code
-			sharedGrp.PUT("/:code", updateSharedBookHandler) // Update book by code
+			sharedGrp.PUT("/:code", updateSharedBookHandler) // Merge book by code
 		}
 	}
 
@@ -117,94 +107,7 @@ func setupRouter() {
 func GetRouter() *gin.Engine {
 	once.Do(func() {
 		initDB()
-		auth.InitGoogleAuth()
 		setupRouter()
 	})
 	return router
-}
-
-// ---- Handlers ----
-
-func googleLoginHandler(c *gin.Context) {
-	state := "random_state" // TODO: Use a secure random string and store in cookie/session
-	url := auth.GetGoogleLoginURL(state)
-	c.Redirect(http.StatusTemporaryRedirect, url)
-}
-
-func googleCallbackHandler(c *gin.Context) {
-	code := c.Query("code")
-	state := c.Query("state")
-
-	// TODO: Verify state properly with cookies/session
-	if state == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid state"})
-		return
-	}
-
-	_, userInfo, err := auth.GetGoogleUserInfo(code)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-
-	// ---- Upsert user into database ----
-	var internalID string
-	if dbPool != nil {
-		query := `
-			INSERT INTO users (google_id, email, name, avatar_url)
-			VALUES ($1, $2, $3, $4)
-			ON CONFLICT (google_id) DO UPDATE 
-			SET name = EXCLUDED.name, 
-			    avatar_url = EXCLUDED.avatar_url, 
-			    email = EXCLUDED.email
-			RETURNING id
-		`
-		err := dbPool.QueryRow(context.Background(), query, userInfo.Id, userInfo.Email, userInfo.Name, userInfo.Picture).Scan(&internalID)
-		if err != nil {
-			log.Printf("Failed to upsert user: %v\n", err)
-			// Fallback: search by google_id if scan failed for some reason
-			dbPool.QueryRow(context.Background(), "SELECT id FROM users WHERE google_id = $1", userInfo.Id).Scan(&internalID)
-		}
-	}
-
-	// Generate our own JWT
-	token, err := auth.GenerateJWT(userInfo.Id, userInfo.Email, userInfo.Name)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate token"})
-		return
-	}
-
-	// Redirect back to frontend with token
-	frontendURL := os.Getenv("FRONTEND_URL")
-	if frontendURL == "" {
-		frontendURL = "http://localhost:5173"
-	}
-
-	// Properly encode user info for URL
-	redirectURL := fmt.Sprintf("%s/login?token=%s&id=%s&name=%s&email=%s&avatar=%s",
-		frontendURL,
-		token,
-		internalID,
-		url.QueryEscape(userInfo.Name),
-		url.QueryEscape(userInfo.Email),
-		url.QueryEscape(userInfo.Picture),
-	)
-
-	c.Redirect(http.StatusTemporaryRedirect, redirectURL)
-}
-
-func registerHandler(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"status": "ok", "msg": "Register API Ready"})
-}
-
-func loginHandler(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"status": "ok", "token": "mock_jwt_token"})
-}
-
-func getRecordsHandler(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"status": "ok", "records": []string{}})
-}
-
-func syncRecordsHandler(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"status": "ok", "msg": "Sync API Ready"})
 }

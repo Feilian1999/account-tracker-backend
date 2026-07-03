@@ -27,6 +27,9 @@ func RunMigrations(databaseURL string) error {
 	if err != nil {
 		return fmt.Errorf("failed to create migrate instance: %w", err)
 	}
+	// Close both the source and database connections opened by migrate,
+	// otherwise every serverless cold start leaks a connection to Neon.
+	defer m.Close()
 
 	err = m.Up()
 	if err != nil {

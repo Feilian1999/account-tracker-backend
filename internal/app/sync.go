@@ -1,8 +1,6 @@
 package app
 
 import (
-	"context"
-	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -10,7 +8,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// normalizeTimestamp attempts to convert non-standard timestamp strings 
+// normalizeTimestamp attempts to convert non-standard timestamp strings
 // (like Go's default time.String() format) into RFC3339 which PostgreSQL prefers.
 func normalizeTimestamp(ts string) string {
 	if ts == "" {
@@ -28,7 +26,7 @@ func normalizeTimestamp(ts string) string {
 	if len(parts) < 3 {
 		return ts
 	}
-	
+
 	cleanTS := strings.Join(parts[:3], " ")
 	layouts := []string{
 		"2006-01-02 15:04:05.999999999 -0700",
@@ -119,296 +117,6 @@ type SyncData struct {
 	Templates       []SyncTemplate       `json:"templates"`
 }
 
-func pushSyncHandler(c *gin.Context) {
-	googleID := c.GetString("user_google_id")
-	if googleID == "" {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "User not identified"})
-		return
-	}
-
-	var data SyncData
-	if err := c.ShouldBindJSON(&data); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	if dbPool == nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database not connected"})
-		return
-	}
-
-	ctx := context.Background()
-	tx, err := dbPool.Begin(ctx)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start transaction"})
-		return
-	}
-	defer tx.Rollback(ctx)
-
-	// Get Internal User ID
-	var userID string
-	err = tx.QueryRow(ctx, "SELECT id FROM users WHERE google_id = $1", googleID).Scan(&userID)
-	if err != nil {
-		log.Printf("[Sync] User lookup failed for google_id %s: %v\n", googleID, err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "User not found in DB"})
-		return
-	}
-
-	// 1. Clear existing data — delete child tables first to avoid FK cascade
-	if _, err := tx.Exec(ctx, "DELETE FROM records WHERE book_id IN (SELECT id FROM books WHERE user_id = $1)", userID); err != nil {
-		log.Printf("[Sync] Failed to clear records: %v\n", err)
-	}
-	if _, err := tx.Exec(ctx, "DELETE FROM book_members WHERE book_id IN (SELECT id FROM books WHERE user_id = $1)", userID); err != nil {
-		log.Printf("[Sync] Failed to clear book_members: %v\n", err)
-	}
-	if _, err := tx.Exec(ctx, "DELETE FROM books WHERE user_id = $1", userID); err != nil {
-		log.Printf("[Sync] Failed to clear books: %v\n", err)
-	}
-	if _, err := tx.Exec(ctx, "DELETE FROM personal_records WHERE user_id = $1", userID); err != nil {
-		log.Printf("[Sync] Failed to clear personal_records: %v\n", err)
-	}
-	if _, err := tx.Exec(ctx, "DELETE FROM record_templates WHERE user_id = $1", userID); err != nil {
-		log.Printf("[Sync] Failed to clear templates: %v\n", err)
-	}
-	if _, err := tx.Exec(ctx, "DELETE FROM categories WHERE user_id = $1", userID); err != nil {
-		log.Printf("[Sync] Failed to clear categories: %v\n", err)
-	}
-
-	// 2. Insert new state
-	// Insert Categories
-	for _, cat := range data.Categories {
-		_, err = tx.Exec(ctx, `
-			INSERT INTO categories (id, user_id, name, type, icon, color, is_default) 
-			VALUES ($1, $2, $3, $4, $5, $6, $7)
-			ON CONFLICT (id) DO UPDATE SET
-				name = EXCLUDED.name,
-				type = EXCLUDED.type,
-				icon = EXCLUDED.icon,
-				color = EXCLUDED.color,
-				is_default = EXCLUDED.is_default
-		`, cat.ID, userID, cat.Name, cat.Type, cat.Icon, cat.Color, cat.IsDefault)
-		if err != nil {
-			log.Printf("[Sync] Category insert error: %v\n", err)
-			insertError(c, "categories", err)
-			return
-		}
-	}
-
-	// Insert Books & Members
-	for _, book := range data.Books {
-		createdAt := normalizeTimestamp(book.CreatedAt)
-		_, err = tx.Exec(ctx, `
-			INSERT INTO books (id, user_id, name, created_at) 
-			VALUES ($1, $2, $3, $4)
-			ON CONFLICT (id) DO UPDATE SET 
-				name = EXCLUDED.name,
-				created_at = EXCLUDED.created_at
-		`, book.ID, userID, book.Name, createdAt)
-		if err != nil {
-			log.Printf("[Sync] Book insert error: %v\n", err)
-			insertError(c, "books", err)
-			return
-		}
-
-		for _, m := range book.Members {
-			var mUserID *string
-			if m.UserID != "" {
-				mUserID = &m.UserID
-				_, _ = tx.Exec(ctx, `
-					INSERT INTO users (id, name, email) 
-					VALUES ($1, $2, $3) 
-					ON CONFLICT (id) DO NOTHING
-				`, m.UserID, m.Name, m.UserID+"@anonymous.local")
-			}
-
-			_, err = tx.Exec(ctx, `
-				INSERT INTO book_members (id, book_id, name, user_id) 
-				VALUES ($1, $2, $3, $4)
-				ON CONFLICT (id) DO UPDATE SET
-					name = EXCLUDED.name,
-					book_id = EXCLUDED.book_id,
-					user_id = EXCLUDED.user_id
-			`, m.ID, book.ID, m.Name, mUserID)
-			if err != nil {
-				log.Printf("[Sync] Member insert error: %v\n", err)
-				insertError(c, "book_members", err)
-				return
-			}
-		}
-	}
-
-	// Insert Shared Records
-	for _, rec := range data.Records {
-		var paidByID *string
-		if rec.PaidByID != "" {
-			paidByID = &rec.PaidByID
-		}
-		date := normalizeDate(rec.Date)
-		_, err = tx.Exec(ctx, `
-			INSERT INTO records (id, book_id, type, amount, category, date, note, paid_by_id, split_among_ids) 
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-			ON CONFLICT (id) DO UPDATE SET
-				type = EXCLUDED.type,
-				amount = EXCLUDED.amount,
-				category = EXCLUDED.category,
-				date = EXCLUDED.date,
-				note = EXCLUDED.note,
-				paid_by_id = EXCLUDED.paid_by_id,
-				split_among_ids = EXCLUDED.split_among_ids
-		`, rec.ID, rec.BookID, rec.Type, rec.Amount, rec.Category, date, rec.Note, paidByID, rec.SplitAmongIds)
-		if err != nil {
-			log.Printf("[Sync] Record insert error: %v\n", err)
-			insertError(c, "records", err)
-			return
-		}
-	}
-
-	// Insert Personal Records
-	for _, rec := range data.PersonalRecords {
-		var sourceBookID *string
-		if rec.SourceBookID != "" {
-			sourceBookID = &rec.SourceBookID
-		}
-		date := normalizeDate(rec.Date)
-		_, err = tx.Exec(ctx, `
-			INSERT INTO personal_records (id, user_id, type, amount, category, date, note, source_book_id) 
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-			ON CONFLICT (id) DO UPDATE SET
-				type = EXCLUDED.type,
-				amount = EXCLUDED.amount,
-				category = EXCLUDED.category,
-				date = EXCLUDED.date,
-				note = EXCLUDED.note,
-				source_book_id = EXCLUDED.source_book_id
-		`, rec.ID, userID, rec.Type, rec.Amount, rec.Category, date, rec.Note, sourceBookID)
-		if err != nil {
-			log.Printf("[Sync] Personal record insert error: %v\n", err)
-			insertError(c, "personal_records", err)
-			return
-		}
-	}
-
-	// Insert Templates
-	for _, tpl := range data.Templates {
-		_, err = tx.Exec(ctx, `
-			INSERT INTO record_templates (id, user_id, name, type, amount, category, note) 
-			VALUES ($1, $2, $3, $4, $5, $6, $7)
-			ON CONFLICT (id) DO UPDATE SET
-				name = EXCLUDED.name,
-				type = EXCLUDED.type,
-				amount = EXCLUDED.amount,
-				category = EXCLUDED.category,
-				note = EXCLUDED.note
-		`, tpl.ID, userID, tpl.Name, tpl.Type, tpl.Amount, tpl.Category, tpl.Note)
-		if err != nil {
-			log.Printf("[Sync] Template insert error: %v\n", err)
-			insertError(c, "templates", err)
-			return
-		}
-	}
-
-	err = tx.Commit(ctx)
-	if err != nil {
-		log.Printf("[Sync] Transaction commit error: %v\n", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to commit transaction"})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"status": "ok", "message": "Data synced to cloud successfully"})
-}
-
-func pullSyncHandler(c *gin.Context) {
-	googleID := c.GetString("user_google_id")
-	if googleID == "" {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "User not identified"})
-		return
-	}
-
-	if dbPool == nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database not connected"})
-		return
-	}
-
-	ctx := context.Background()
-
-	// Get Internal User ID
-	var userID string
-	err := dbPool.QueryRow(ctx, "SELECT id FROM users WHERE google_id = $1", googleID).Scan(&userID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "User not found"})
-		return
-	}
-
-	data := SyncData{
-		Books:           []SyncBook{},
-		Records:         []SyncRecord{},
-		PersonalRecords: []SyncPersonalRecord{},
-		Categories:      []SyncCategory{},
-		Templates:       []SyncTemplate{},
-	}
-
-	// Fetch Categories
-	rows, _ := dbPool.Query(ctx, "SELECT id, name, type, icon, color, is_default FROM categories WHERE user_id = $1", userID)
-	for rows.Next() {
-		var item SyncCategory
-		_ = rows.Scan(&item.ID, &item.Name, &item.Type, &item.Icon, &item.Color, &item.IsDefault)
-		data.Categories = append(data.Categories, item)
-	}
-
-	// Fetch Books
-	rows, _ = dbPool.Query(ctx, "SELECT id, name, created_at FROM books WHERE user_id = $1", userID)
-	for rows.Next() {
-		var item SyncBook
-		var createdAt time.Time
-		_ = rows.Scan(&item.ID, &item.Name, &createdAt)
-		item.CreatedAt = createdAt.Format(time.RFC3339)
-
-		// Fetch Members for each book
-		mRows, _ := dbPool.Query(ctx, "SELECT id, name, COALESCE(user_id::text, '') FROM book_members WHERE book_id = $1", item.ID)
-		item.Members = []SyncMember{}
-		for mRows.Next() {
-			var m SyncMember
-			_ = mRows.Scan(&m.ID, &m.Name, &m.UserID)
-			item.Members = append(item.Members, m)
-		}
-		data.Books = append(data.Books, item)
-	}
-
-	// Fetch Shared Records
-	rows, _ = dbPool.Query(ctx, `
-		SELECT r.id, r.book_id, r.type, r.amount, r.category, r.date, r.note, r.paid_by_id, r.split_among_ids 
-		FROM records r 
-		JOIN books b ON r.book_id = b.id 
-		WHERE b.user_id = $1`, userID)
-	for rows.Next() {
-		var item SyncRecord
-		var date time.Time
-		_ = rows.Scan(&item.ID, &item.BookID, &item.Type, &item.Amount, &item.Category, &date, &item.Note, &item.PaidByID, &item.SplitAmongIds)
-		item.Date = date.Format("2006-01-02")
-		data.Records = append(data.Records, item)
-	}
-
-	// Fetch Personal Records
-	rows, _ = dbPool.Query(ctx, "SELECT id, type, amount, category, date, note, COALESCE(source_book_id::text, '') FROM personal_records WHERE user_id = $1", userID)
-	for rows.Next() {
-		var item SyncPersonalRecord
-		var date time.Time
-		_ = rows.Scan(&item.ID, &item.Type, &item.Amount, &item.Category, &date, &item.Note, &item.SourceBookID)
-		item.Date = date.Format("2006-01-02")
-		data.PersonalRecords = append(data.PersonalRecords, item)
-	}
-
-	// Fetch Templates
-	rows, _ = dbPool.Query(ctx, "SELECT id, name, type, amount, category, note FROM record_templates WHERE user_id = $1", userID)
-	for rows.Next() {
-		var item SyncTemplate
-		_ = rows.Scan(&item.ID, &item.Name, &item.Type, &item.Amount, &item.Category, &item.Note)
-		data.Templates = append(data.Templates, item)
-	}
-
-	c.JSON(http.StatusOK, data)
-}
-
 func pushSyncByUUIDHandler(c *gin.Context) {
 	// Since SyncData is a struct, we manually bind to a wrapper
 	var wrapper struct {
@@ -435,27 +143,7 @@ func pushSyncByUUIDHandler(c *gin.Context) {
 		return
 	}
 
-	ctx := context.Background()
-
-	// Ensure user exists or create anonymous
-	var userID string
-	err := dbPool.QueryRow(ctx, "SELECT id FROM users WHERE id = $1", wrapper.UUID).Scan(&userID)
-	
-	if err == nil {
-		// User exists — allow backup regardless of account type
-	} else {
-		// Create anonymous user (ON CONFLICT to handle race conditions / retries)
-		_, err = dbPool.Exec(ctx, `
-			INSERT INTO users (id, name, email) VALUES ($1, $2, $3)
-			ON CONFLICT (id) DO NOTHING
-		`, wrapper.UUID, "Anonymous", wrapper.UUID+"@anonymous.local")
-		if err != nil {
-			log.Printf("[Sync] Failed to create anonymous user: %v\n", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create user entry"})
-			return
-		}
-		userID = wrapper.UUID
-	}
+	ctx := c.Request.Context()
 
 	tx, err := dbPool.Begin(ctx)
 	if err != nil {
@@ -464,31 +152,39 @@ func pushSyncByUUIDHandler(c *gin.Context) {
 	}
 	defer tx.Rollback(ctx)
 
-	// Clear existing data — delete child tables first to avoid FK cascade issues
-	// records & book_members depend on books, so delete them before books
-	if _, err := tx.Exec(ctx, "DELETE FROM records WHERE book_id IN (SELECT id FROM books WHERE user_id = $1)", userID); err != nil {
-		log.Printf("[Sync] Failed to clear records: %v\n", err)
+	// Ensure the user row exists (create anonymous account on first backup).
+	// Done inside the transaction so a later failure does not leave an orphan user.
+	userID := wrapper.UUID
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO users (id, name, email) VALUES ($1, $2, $3)
+		ON CONFLICT (id) DO NOTHING
+	`, userID, "Anonymous", userID+"@anonymous.local"); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create user entry"})
+		return
 	}
-	if _, err := tx.Exec(ctx, "DELETE FROM book_members WHERE book_id IN (SELECT id FROM books WHERE user_id = $1)", userID); err != nil {
-		log.Printf("[Sync] Failed to clear book_members: %v\n", err)
+
+	// Clear existing data — delete child tables first to avoid FK cascade issues.
+	// A failed clear must abort the whole push, otherwise stale rows would survive
+	// the "full replace" and mix with the newly inserted state.
+	clears := []string{
+		"DELETE FROM records WHERE book_id IN (SELECT id FROM books WHERE user_id = $1)",
+		"DELETE FROM book_members WHERE book_id IN (SELECT id FROM books WHERE user_id = $1)",
+		"DELETE FROM books WHERE user_id = $1",
+		"DELETE FROM personal_records WHERE user_id = $1",
+		"DELETE FROM record_templates WHERE user_id = $1",
+		"DELETE FROM categories WHERE user_id = $1",
 	}
-	if _, err := tx.Exec(ctx, "DELETE FROM books WHERE user_id = $1", userID); err != nil {
-		log.Printf("[Sync] Failed to clear books: %v\n", err)
-	}
-	if _, err := tx.Exec(ctx, "DELETE FROM personal_records WHERE user_id = $1", userID); err != nil {
-		log.Printf("[Sync] Failed to clear personal_records: %v\n", err)
-	}
-	if _, err := tx.Exec(ctx, "DELETE FROM record_templates WHERE user_id = $1", userID); err != nil {
-		log.Printf("[Sync] Failed to clear templates: %v\n", err)
-	}
-	if _, err := tx.Exec(ctx, "DELETE FROM categories WHERE user_id = $1", userID); err != nil {
-		log.Printf("[Sync] Failed to clear categories: %v\n", err)
+	for _, q := range clears {
+		if _, err := tx.Exec(ctx, q, userID); err != nil {
+			insertError(c, "clear", err)
+			return
+		}
 	}
 
 	// Insert Categories
 	for _, cat := range wrapper.Categories {
 		_, err = tx.Exec(ctx, `
-			INSERT INTO categories (id, user_id, name, type, icon, color, is_default) 
+			INSERT INTO categories (id, user_id, name, type, icon, color, is_default)
 			VALUES ($1, $2, $3, $4, $5, $6, $7)
 			ON CONFLICT (id) DO UPDATE SET
 				name = EXCLUDED.name,
@@ -496,6 +192,7 @@ func pushSyncByUUIDHandler(c *gin.Context) {
 				icon = EXCLUDED.icon,
 				color = EXCLUDED.color,
 				is_default = EXCLUDED.is_default
+			WHERE categories.user_id = $2
 		`, cat.ID, userID, cat.Name, cat.Type, cat.Icon, cat.Color, cat.IsDefault)
 		if err != nil {
 			insertError(c, "categories", err)
@@ -507,9 +204,9 @@ func pushSyncByUUIDHandler(c *gin.Context) {
 	for _, book := range wrapper.Books {
 		createdAt := normalizeTimestamp(book.CreatedAt)
 		_, err = tx.Exec(ctx, `
-			INSERT INTO books (id, user_id, name, created_at) 
+			INSERT INTO books (id, user_id, name, created_at)
 			VALUES ($1, $2, $3, $4)
-			ON CONFLICT (id) DO UPDATE SET 
+			ON CONFLICT (id) DO UPDATE SET
 				name = EXCLUDED.name,
 				created_at = EXCLUDED.created_at
 			WHERE books.user_id = $2
@@ -524,20 +221,22 @@ func pushSyncByUUIDHandler(c *gin.Context) {
 			if m.UserID != "" {
 				mUserID = &m.UserID
 				_, _ = tx.Exec(ctx, `
-					INSERT INTO users (id, name, email) 
-					VALUES ($1, $2, $3) 
+					INSERT INTO users (id, name, email)
+					VALUES ($1, $2, $3)
 					ON CONFLICT (id) DO NOTHING
 				`, m.UserID, m.Name, m.UserID+"@anonymous.local")
 			}
 
+			// Guard: only write members into a book that this user owns.
 			_, err = tx.Exec(ctx, `
-				INSERT INTO book_members (id, book_id, name, user_id) 
-				VALUES ($1, $2, $3, $4)
+				INSERT INTO book_members (id, book_id, name, user_id)
+				SELECT $1, $2, $3, $4
+				WHERE EXISTS (SELECT 1 FROM books WHERE id = $2 AND user_id = $5)
 				ON CONFLICT (id) DO UPDATE SET
 					name = EXCLUDED.name,
 					book_id = EXCLUDED.book_id,
 					user_id = EXCLUDED.user_id
-			`, m.ID, book.ID, m.Name, mUserID)
+			`, m.ID, book.ID, m.Name, mUserID, userID)
 			if err != nil {
 				insertError(c, "book_members", err)
 				return
@@ -545,7 +244,7 @@ func pushSyncByUUIDHandler(c *gin.Context) {
 		}
 	}
 
-	// Shared Records
+	// Shared Records — guard: only write into a book that this user owns.
 	for _, rec := range wrapper.Records {
 		var paidByID *string
 		if rec.PaidByID != "" {
@@ -553,8 +252,9 @@ func pushSyncByUUIDHandler(c *gin.Context) {
 		}
 		date := normalizeDate(rec.Date)
 		_, err = tx.Exec(ctx, `
-			INSERT INTO records (id, book_id, type, amount, category, date, note, paid_by_id, split_among_ids) 
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+			INSERT INTO records (id, book_id, type, amount, category, date, note, paid_by_id, split_among_ids)
+			SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9
+			WHERE EXISTS (SELECT 1 FROM books WHERE id = $2 AND user_id = $10)
 			ON CONFLICT (id) DO UPDATE SET
 				type = EXCLUDED.type,
 				amount = EXCLUDED.amount,
@@ -563,7 +263,7 @@ func pushSyncByUUIDHandler(c *gin.Context) {
 				note = EXCLUDED.note,
 				paid_by_id = EXCLUDED.paid_by_id,
 				split_among_ids = EXCLUDED.split_among_ids
-		`, rec.ID, rec.BookID, rec.Type, rec.Amount, rec.Category, date, rec.Note, paidByID, rec.SplitAmongIds)
+		`, rec.ID, rec.BookID, rec.Type, rec.Amount, rec.Category, date, rec.Note, paidByID, rec.SplitAmongIds, userID)
 		if err != nil {
 			insertError(c, "records", err)
 			return
@@ -578,7 +278,7 @@ func pushSyncByUUIDHandler(c *gin.Context) {
 		}
 		date := normalizeDate(rec.Date)
 		_, err = tx.Exec(ctx, `
-			INSERT INTO personal_records (id, user_id, type, amount, category, date, note, source_book_id) 
+			INSERT INTO personal_records (id, user_id, type, amount, category, date, note, source_book_id)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 			ON CONFLICT (id) DO UPDATE SET
 				type = EXCLUDED.type,
@@ -587,6 +287,7 @@ func pushSyncByUUIDHandler(c *gin.Context) {
 				date = EXCLUDED.date,
 				note = EXCLUDED.note,
 				source_book_id = EXCLUDED.source_book_id
+			WHERE personal_records.user_id = $2
 		`, rec.ID, userID, rec.Type, rec.Amount, rec.Category, date, rec.Note, sourceBookID)
 		if err != nil {
 			insertError(c, "personal_records", err)
@@ -597,7 +298,7 @@ func pushSyncByUUIDHandler(c *gin.Context) {
 	// Templates
 	for _, tpl := range wrapper.Templates {
 		_, err = tx.Exec(ctx, `
-			INSERT INTO record_templates (id, user_id, name, type, amount, category, note) 
+			INSERT INTO record_templates (id, user_id, name, type, amount, category, note)
 			VALUES ($1, $2, $3, $4, $5, $6, $7)
 			ON CONFLICT (id) DO UPDATE SET
 				name = EXCLUDED.name,
@@ -605,6 +306,7 @@ func pushSyncByUUIDHandler(c *gin.Context) {
 				amount = EXCLUDED.amount,
 				category = EXCLUDED.category,
 				note = EXCLUDED.note
+			WHERE record_templates.user_id = $2
 		`, tpl.ID, userID, tpl.Name, tpl.Type, tpl.Amount, tpl.Category, tpl.Note)
 		if err != nil {
 			insertError(c, "templates", err)
@@ -632,7 +334,7 @@ func pullSyncByUUIDHandler(c *gin.Context) {
 		return
 	}
 
-	ctx := context.Background()
+	ctx := c.Request.Context()
 
 	// Get Internal User ID
 	var userID string
@@ -651,80 +353,145 @@ func pullSyncByUUIDHandler(c *gin.Context) {
 	}
 
 	// Fetch Categories
-	rows, _ := dbPool.Query(ctx, "SELECT id, name, type, icon, color, is_default FROM categories WHERE user_id = $1", userID)
-	if rows != nil {
-		for rows.Next() {
-			var item SyncCategory
-			_ = rows.Scan(&item.ID, &item.Name, &item.Type, &item.Icon, &item.Color, &item.IsDefault)
-			data.Categories = append(data.Categories, item)
+	rows, err := dbPool.Query(ctx, "SELECT id, name, type, icon, color, is_default FROM categories WHERE user_id = $1", userID)
+	if err != nil {
+		pullError(c, err)
+		return
+	}
+	for rows.Next() {
+		var item SyncCategory
+		if err := rows.Scan(&item.ID, &item.Name, &item.Type, &item.Icon, &item.Color, &item.IsDefault); err != nil {
+			rows.Close()
+			pullError(c, err)
+			return
 		}
-		rows.Close()
+		data.Categories = append(data.Categories, item)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		pullError(c, err)
+		return
 	}
 
 	// Fetch Books
-	rows, _ = dbPool.Query(ctx, "SELECT id, name, created_at FROM books WHERE user_id = $1", userID)
-	if rows != nil {
-		for rows.Next() {
-			var item SyncBook
-			var createdAt time.Time
-			_ = rows.Scan(&item.ID, &item.Name, &createdAt)
-			item.CreatedAt = createdAt.Format(time.RFC3339)
-
-			// Fetch Members for each book
-			mRows, _ := dbPool.Query(ctx, "SELECT id, name, COALESCE(user_id::text, '') FROM book_members WHERE book_id = $1", item.ID)
-			item.Members = []SyncMember{}
-			if mRows != nil {
-				for mRows.Next() {
-					var m SyncMember
-					_ = mRows.Scan(&m.ID, &m.Name, &m.UserID)
-					item.Members = append(item.Members, m)
-				}
-				mRows.Close()
-			}
-			data.Books = append(data.Books, item)
+	rows, err = dbPool.Query(ctx, "SELECT id, name, created_at FROM books WHERE user_id = $1", userID)
+	if err != nil {
+		pullError(c, err)
+		return
+	}
+	var books []SyncBook
+	for rows.Next() {
+		var item SyncBook
+		var createdAt time.Time
+		if err := rows.Scan(&item.ID, &item.Name, &createdAt); err != nil {
+			rows.Close()
+			pullError(c, err)
+			return
 		}
-		rows.Close()
+		item.CreatedAt = createdAt.Format(time.RFC3339)
+		item.Members = []SyncMember{}
+		books = append(books, item)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		pullError(c, err)
+		return
 	}
 
-	// Fetch Shared Records
-	rows, _ = dbPool.Query(ctx, `
-		SELECT r.id, r.book_id, r.type, r.amount, r.category, r.date, r.note, r.paid_by_id, r.split_among_ids 
-		FROM records r 
-		JOIN books b ON r.book_id = b.id 
-		WHERE b.user_id = $1`, userID)
-	if rows != nil {
-		for rows.Next() {
-			var item SyncRecord
-			var date time.Time
-			_ = rows.Scan(&item.ID, &item.BookID, &item.Type, &item.Amount, &item.Category, &date, &item.Note, &item.PaidByID, &item.SplitAmongIds)
-			item.Date = date.Format("2006-01-02")
-			data.Records = append(data.Records, item)
+	// Fetch Members for each book (after the books cursor is closed, to avoid
+	// holding two pooled connections at once).
+	for i := range books {
+		mRows, err := dbPool.Query(ctx, "SELECT id, name, COALESCE(user_id::text, '') FROM book_members WHERE book_id = $1", books[i].ID)
+		if err != nil {
+			pullError(c, err)
+			return
 		}
-		rows.Close()
+		for mRows.Next() {
+			var m SyncMember
+			if err := mRows.Scan(&m.ID, &m.Name, &m.UserID); err != nil {
+				mRows.Close()
+				pullError(c, err)
+				return
+			}
+			books[i].Members = append(books[i].Members, m)
+		}
+		mRows.Close()
+		if err := mRows.Err(); err != nil {
+			pullError(c, err)
+			return
+		}
+	}
+	data.Books = books
+
+	// Fetch Shared Records
+	rows, err = dbPool.Query(ctx, `
+		SELECT r.id, r.book_id, r.type, r.amount, r.category, r.date, r.note, COALESCE(r.paid_by_id::text, ''), r.split_among_ids
+		FROM records r
+		JOIN books b ON r.book_id = b.id
+		WHERE b.user_id = $1`, userID)
+	if err != nil {
+		pullError(c, err)
+		return
+	}
+	for rows.Next() {
+		var item SyncRecord
+		var date time.Time
+		if err := rows.Scan(&item.ID, &item.BookID, &item.Type, &item.Amount, &item.Category, &date, &item.Note, &item.PaidByID, &item.SplitAmongIds); err != nil {
+			rows.Close()
+			pullError(c, err)
+			return
+		}
+		item.Date = date.Format("2006-01-02")
+		data.Records = append(data.Records, item)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		pullError(c, err)
+		return
 	}
 
 	// Fetch Personal Records
-	rows, _ = dbPool.Query(ctx, "SELECT id, type, amount, category, date, note, COALESCE(source_book_id::text, '') FROM personal_records WHERE user_id = $1", userID)
-	if rows != nil {
-		for rows.Next() {
-			var item SyncPersonalRecord
-			var date time.Time
-			_ = rows.Scan(&item.ID, &item.Type, &item.Amount, &item.Category, &date, &item.Note, &item.SourceBookID)
-			item.Date = date.Format("2006-01-02")
-			data.PersonalRecords = append(data.PersonalRecords, item)
+	rows, err = dbPool.Query(ctx, "SELECT id, type, amount, category, date, note, COALESCE(source_book_id::text, '') FROM personal_records WHERE user_id = $1", userID)
+	if err != nil {
+		pullError(c, err)
+		return
+	}
+	for rows.Next() {
+		var item SyncPersonalRecord
+		var date time.Time
+		if err := rows.Scan(&item.ID, &item.Type, &item.Amount, &item.Category, &date, &item.Note, &item.SourceBookID); err != nil {
+			rows.Close()
+			pullError(c, err)
+			return
 		}
-		rows.Close()
+		item.Date = date.Format("2006-01-02")
+		data.PersonalRecords = append(data.PersonalRecords, item)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		pullError(c, err)
+		return
 	}
 
 	// Fetch Templates
-	rows, _ = dbPool.Query(ctx, "SELECT id, name, type, amount, category, note FROM record_templates WHERE user_id = $1", userID)
-	if rows != nil {
-		for rows.Next() {
-			var item SyncTemplate
-			_ = rows.Scan(&item.ID, &item.Name, &item.Type, &item.Amount, &item.Category, &item.Note)
-			data.Templates = append(data.Templates, item)
+	rows, err = dbPool.Query(ctx, "SELECT id, name, type, amount, category, note FROM record_templates WHERE user_id = $1", userID)
+	if err != nil {
+		pullError(c, err)
+		return
+	}
+	for rows.Next() {
+		var item SyncTemplate
+		if err := rows.Scan(&item.ID, &item.Name, &item.Type, &item.Amount, &item.Category, &item.Note); err != nil {
+			rows.Close()
+			pullError(c, err)
+			return
 		}
-		rows.Close()
+		data.Templates = append(data.Templates, item)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		pullError(c, err)
+		return
 	}
 
 	c.JSON(http.StatusOK, data)
@@ -732,4 +499,10 @@ func pullSyncByUUIDHandler(c *gin.Context) {
 
 func insertError(c *gin.Context, table string, err error) {
 	c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to insert into " + table + ": " + err.Error()})
+}
+
+// pullError aborts a pull with 500 so the client never mistakes a transient DB
+// failure for "the cloud is empty" (which would wipe local data on the next push).
+func pullError(c *gin.Context, err error) {
+	c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to read backup: " + err.Error()})
 }

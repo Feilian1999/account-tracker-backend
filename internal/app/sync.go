@@ -1,12 +1,59 @@
 package app
 
 import (
+	"context"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/jackc/pgx/v5"
 )
+
+// queued is one statement waiting to be pipelined, plus the table label used in
+// the error message if it fails.
+type queued struct {
+	table string
+	sql   string
+	args  []any
+}
+
+// pipelineChunk bounds how many statements are sent per round trip.
+const pipelineChunk = 500
+
+// execPipelined runs stmts in order inside tx, pipelining them in chunks so a
+// full-replace backup costs a handful of network round trips instead of one per
+// row. Sending them one at a time made backup latency scale with record count:
+// at the ~100-400ms round trip to Neon, a few hundred records exceeded both the
+// client timeout and the serverless function's time budget, so the backup spun
+// and then failed. Statement order is preserved, which the FKs depend on
+// (book_members must land before the records that reference them).
+func execPipelined(ctx context.Context, tx pgx.Tx, stmts []queued) (string, error) {
+	for start := 0; start < len(stmts); start += pipelineChunk {
+		end := start + pipelineChunk
+		if end > len(stmts) {
+			end = len(stmts)
+		}
+		chunk := stmts[start:end]
+
+		batch := &pgx.Batch{}
+		for _, s := range chunk {
+			batch.Queue(s.sql, s.args...)
+		}
+
+		br := tx.SendBatch(ctx, batch)
+		for i := range chunk {
+			if _, err := br.Exec(); err != nil {
+				br.Close()
+				return chunk[i].table, err
+			}
+		}
+		if err := br.Close(); err != nil {
+			return chunk[0].table, err
+		}
+	}
+	return "", nil
+}
 
 // normalizeTimestamp attempts to convert non-standard timestamp strings
 // (like Go's default time.String() format) into RFC3339 which PostgreSQL prefers.
@@ -152,16 +199,17 @@ func pushSyncByUUIDHandler(c *gin.Context) {
 	}
 	defer tx.Rollback(ctx)
 
+	userID := wrapper.UUID
+
+	// Everything below is queued and then pipelined in order — see execPipelined.
+	stmts := make([]queued, 0, 16+len(wrapper.Categories)+len(wrapper.Books)+len(wrapper.Records)+len(wrapper.PersonalRecords)+len(wrapper.Templates))
+
 	// Ensure the user row exists (create anonymous account on first backup).
 	// Done inside the transaction so a later failure does not leave an orphan user.
-	userID := wrapper.UUID
-	if _, err := tx.Exec(ctx, `
+	stmts = append(stmts, queued{"users", `
 		INSERT INTO users (id, name, email) VALUES ($1, $2, $3)
 		ON CONFLICT (id) DO NOTHING
-	`, userID, "Anonymous", userID+"@anonymous.local"); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create user entry"})
-		return
-	}
+	`, []any{userID, "Anonymous", userID + "@anonymous.local"}})
 
 	// Clear existing data — delete child tables first to avoid FK cascade issues.
 	// A failed clear must abort the whole push, otherwise stale rows would survive
@@ -175,15 +223,12 @@ func pushSyncByUUIDHandler(c *gin.Context) {
 		"DELETE FROM categories WHERE user_id = $1",
 	}
 	for _, q := range clears {
-		if _, err := tx.Exec(ctx, q, userID); err != nil {
-			insertError(c, "clear", err)
-			return
-		}
+		stmts = append(stmts, queued{"clear", q, []any{userID}})
 	}
 
 	// Insert Categories
 	for _, cat := range wrapper.Categories {
-		_, err = tx.Exec(ctx, `
+		stmts = append(stmts, queued{"categories", `
 			INSERT INTO categories (id, user_id, name, type, icon, color, is_default)
 			VALUES ($1, $2, $3, $4, $5, $6, $7)
 			ON CONFLICT (id) DO UPDATE SET
@@ -193,42 +238,36 @@ func pushSyncByUUIDHandler(c *gin.Context) {
 				color = EXCLUDED.color,
 				is_default = EXCLUDED.is_default
 			WHERE categories.user_id = $2
-		`, cat.ID, userID, cat.Name, cat.Type, cat.Icon, cat.Color, cat.IsDefault)
-		if err != nil {
-			insertError(c, "categories", err)
-			return
-		}
+		`, []any{cat.ID, userID, cat.Name, cat.Type, cat.Icon, cat.Color, cat.IsDefault}})
 	}
 
 	// Books & Members
 	for _, book := range wrapper.Books {
 		createdAt := normalizeTimestamp(book.CreatedAt)
-		_, err = tx.Exec(ctx, `
+		stmts = append(stmts, queued{"books", `
 			INSERT INTO books (id, user_id, name, created_at)
 			VALUES ($1, $2, $3, $4)
 			ON CONFLICT (id) DO UPDATE SET
 				name = EXCLUDED.name,
 				created_at = EXCLUDED.created_at
 			WHERE books.user_id = $2
-		`, book.ID, userID, book.Name, createdAt)
-		if err != nil {
-			insertError(c, "books", err)
-			return
-		}
+		`, []any{book.ID, userID, book.Name, createdAt}})
 
 		for _, m := range book.Members {
 			var mUserID *string
 			if m.UserID != "" {
 				mUserID = &m.UserID
-				_, _ = tx.Exec(ctx, `
+				// book_members.user_id is an FK to users, so the member's public
+				// identity needs a row of its own.
+				stmts = append(stmts, queued{"users", `
 					INSERT INTO users (id, name, email)
 					VALUES ($1, $2, $3)
 					ON CONFLICT (id) DO NOTHING
-				`, m.UserID, m.Name, m.UserID+"@anonymous.local")
+				`, []any{m.UserID, m.Name, m.UserID + "@anonymous.local"}})
 			}
 
 			// Guard: only write members into a book that this user owns.
-			_, err = tx.Exec(ctx, `
+			stmts = append(stmts, queued{"book_members", `
 				INSERT INTO book_members (id, book_id, name, user_id)
 				SELECT $1, $2, $3, $4
 				WHERE EXISTS (SELECT 1 FROM books WHERE id = $2 AND user_id = $5)
@@ -236,11 +275,7 @@ func pushSyncByUUIDHandler(c *gin.Context) {
 					name = EXCLUDED.name,
 					book_id = EXCLUDED.book_id,
 					user_id = EXCLUDED.user_id
-			`, m.ID, book.ID, m.Name, mUserID, userID)
-			if err != nil {
-				insertError(c, "book_members", err)
-				return
-			}
+			`, []any{m.ID, book.ID, m.Name, mUserID, userID}})
 		}
 	}
 
@@ -251,7 +286,7 @@ func pushSyncByUUIDHandler(c *gin.Context) {
 			paidByID = &rec.PaidByID
 		}
 		date := normalizeDate(rec.Date)
-		_, err = tx.Exec(ctx, `
+		stmts = append(stmts, queued{"records", `
 			INSERT INTO records (id, book_id, type, amount, category, date, note, paid_by_id, split_among_ids)
 			SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9
 			WHERE EXISTS (SELECT 1 FROM books WHERE id = $2 AND user_id = $10)
@@ -263,11 +298,7 @@ func pushSyncByUUIDHandler(c *gin.Context) {
 				note = EXCLUDED.note,
 				paid_by_id = EXCLUDED.paid_by_id,
 				split_among_ids = EXCLUDED.split_among_ids
-		`, rec.ID, rec.BookID, rec.Type, rec.Amount, rec.Category, date, rec.Note, paidByID, rec.SplitAmongIds, userID)
-		if err != nil {
-			insertError(c, "records", err)
-			return
-		}
+		`, []any{rec.ID, rec.BookID, rec.Type, rec.Amount, rec.Category, date, rec.Note, paidByID, rec.SplitAmongIds, userID}})
 	}
 
 	// Personal Records
@@ -277,7 +308,7 @@ func pushSyncByUUIDHandler(c *gin.Context) {
 			sourceBookID = &rec.SourceBookID
 		}
 		date := normalizeDate(rec.Date)
-		_, err = tx.Exec(ctx, `
+		stmts = append(stmts, queued{"personal_records", `
 			INSERT INTO personal_records (id, user_id, type, amount, category, date, note, source_book_id)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 			ON CONFLICT (id) DO UPDATE SET
@@ -288,16 +319,12 @@ func pushSyncByUUIDHandler(c *gin.Context) {
 				note = EXCLUDED.note,
 				source_book_id = EXCLUDED.source_book_id
 			WHERE personal_records.user_id = $2
-		`, rec.ID, userID, rec.Type, rec.Amount, rec.Category, date, rec.Note, sourceBookID)
-		if err != nil {
-			insertError(c, "personal_records", err)
-			return
-		}
+		`, []any{rec.ID, userID, rec.Type, rec.Amount, rec.Category, date, rec.Note, sourceBookID}})
 	}
 
 	// Templates
 	for _, tpl := range wrapper.Templates {
-		_, err = tx.Exec(ctx, `
+		stmts = append(stmts, queued{"record_templates", `
 			INSERT INTO record_templates (id, user_id, name, type, amount, category, note)
 			VALUES ($1, $2, $3, $4, $5, $6, $7)
 			ON CONFLICT (id) DO UPDATE SET
@@ -307,11 +334,12 @@ func pushSyncByUUIDHandler(c *gin.Context) {
 				category = EXCLUDED.category,
 				note = EXCLUDED.note
 			WHERE record_templates.user_id = $2
-		`, tpl.ID, userID, tpl.Name, tpl.Type, tpl.Amount, tpl.Category, tpl.Note)
-		if err != nil {
-			insertError(c, "templates", err)
-			return
-		}
+		`, []any{tpl.ID, userID, tpl.Name, tpl.Type, tpl.Amount, tpl.Category, tpl.Note}})
+	}
+
+	if table, err := execPipelined(ctx, tx, stmts); err != nil {
+		insertError(c, table, err)
+		return
 	}
 
 	if err := tx.Commit(ctx); err != nil {

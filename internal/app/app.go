@@ -78,7 +78,14 @@ func setupRouter() {
 		if dbPool == nil {
 			dbStatus = "disconnected"
 		}
-		c.JSON(http.StatusOK, gin.H{"message": "pong", "db": dbStatus})
+		// Report the deployed commit: a failed Vercel deploy keeps serving the
+		// previous one, and /ping was otherwise identical across versions, so
+		// there was no way to tell whether a fix had actually shipped.
+		c.JSON(http.StatusOK, gin.H{
+			"message": "pong",
+			"db":      dbStatus,
+			"commit":  os.Getenv("VERCEL_GIT_COMMIT_SHA"),
+		})
 	})
 
 	api := r.Group("/api")

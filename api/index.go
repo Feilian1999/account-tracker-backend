@@ -1,8 +1,8 @@
 package handler
 
 import (
-	"net/http"
 	"github.com/feilian1999/account-tracker-backend/internal/app"
+	"net/http"
 )
 
 func Handler(w http.ResponseWriter, r *http.Request) {

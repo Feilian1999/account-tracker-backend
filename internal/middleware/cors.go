@@ -14,12 +14,12 @@ import (
 // can be added via the comma-separated CORS_ORIGINS env var.
 func allowedOrigins() []string {
 	origins := []string{
-		"http://localhost:5173",                    // Vite dev server
-		"http://localhost:4173",                    // Vite preview
-		"https://account-tracker-psi.vercel.app",   // production web
-		"capacitor://localhost",                    // Capacitor iOS
-		"http://localhost",                         // Capacitor Android (http scheme)
-		"https://localhost",                        // Capacitor Android (https scheme)
+		"http://localhost:5173",                  // Vite dev server
+		"http://localhost:4173",                  // Vite preview
+		"https://account-tracker-psi.vercel.app", // production web
+		"capacitor://localhost",                  // Capacitor iOS
+		"http://localhost",                       // Capacitor Android (http scheme)
+		"https://localhost",                      // Capacitor Android (https scheme)
 	}
 	if extra := os.Getenv("CORS_ORIGINS"); extra != "" {
 		for _, o := range strings.Split(extra, ",") {

@@ -32,8 +32,20 @@ func allowedOrigins() []string {
 }
 
 func CORS() gin.HandlerFunc {
+	// Match via AllowOriginFunc rather than AllowOrigins: gin-contrib/cors
+	// validates that every AllowOrigins entry starts with http:// or https://
+	// and PANICS otherwise, which rules out Capacitor's native capacitor://
+	// origin and would take down the whole router on startup.
+	allowed := make(map[string]struct{})
+	for _, o := range allowedOrigins() {
+		allowed[o] = struct{}{}
+	}
+
 	config := cors.DefaultConfig()
-	config.AllowOrigins = allowedOrigins()
+	config.AllowOriginFunc = func(origin string) bool {
+		_, ok := allowed[origin]
+		return ok
+	}
 	config.AllowCredentials = true
 	config.AllowMethods = []string{"POST", "OPTIONS", "GET", "PUT", "DELETE"}
 	config.AllowHeaders = []string{

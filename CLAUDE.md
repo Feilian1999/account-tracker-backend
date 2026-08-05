@@ -59,7 +59,7 @@ GET  /api/sync/pull-uuid/:uuid     # return all of that UUID's data (500 on DB e
 
 POST /api/shared/share             # create share code → stores full payload as JSONB
 GET  /api/shared/:code             # fetch payload by code
-PUT  /api/shared/:code             # MERGE payload by code (records by id + deletedIds; members unioned)
+PUT  /api/shared/:code             # MERGE payload by code (records by id + deletedIds; members unioned + deletedMemberIds)
 ```
 
 The UUID sync endpoints are unauthenticated by design: the client UUID is a secret,
@@ -99,7 +99,7 @@ Pull = SELECT all rows for this UUID. Any DB error returns 500 (never a partial/
 UUID-based sync creates a `users` row with `id = uuid` and `email = uuid@anonymous.local` (inside the push transaction). `users.google_id` / `avatar_url` columns still exist in the schema but are unused.
 
 ### Shared-book merge
-`updateSharedBookHandler` MERGES the pusher's snapshot into the stored payload instead of overwriting it: records are unioned by id (incoming wins), ids listed in the request's `deletedIds` are removed, and book members are unioned by id. This prevents two members editing concurrently from clobbering each other. Share codes are 8 chars (older 6-char codes still resolve).
+`updateSharedBookHandler` MERGES the pusher's snapshot into the stored payload instead of overwriting it: records are unioned by id (incoming wins), ids listed in the request's `deletedIds` are removed, and book members are unioned by id — except ids in `deletedMemberIds`, which are removed the same way. This prevents two members editing concurrently from clobbering each other. Share codes are 8 chars (older 6-char codes still resolve).
 
 ### Router singleton
 `GetRouter()` uses `sync.Once` — safe for both Vercel (cold start per request) and standalone (persistent process). The pgx pool is capped (`MaxConns=2`) for serverless; migrations close their own connection.

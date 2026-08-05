@@ -94,7 +94,8 @@ func getSharedBookHandler(c *gin.Context) {
 // book concurrently would clobber each other's records (last-write-wins on the
 // whole blob). Records are merged by id (incoming wins), explicit deletedIds are
 // removed, and book members are unioned by id so a concurrently-added member is
-// not lost.
+// not lost — except ids listed in deletedMemberIds, which are removed same as
+// deletedIds for records.
 func updateSharedBookHandler(c *gin.Context) {
 	code := c.Param("code")
 
@@ -220,10 +221,21 @@ func mergeSharedPayload(existing, incoming map[string]interface{}) map[string]in
 			addMembers(asSlice(eb, "members"))
 		}
 		addMembers(asSlice(book, "members"))
+
+		if deletedMembers, ok := incoming["deletedMemberIds"].([]interface{}); ok {
+			for _, d := range deletedMembers {
+				if id, ok := d.(string); ok {
+					delete(memberByID, id)
+				}
+			}
+		}
+
 		if len(memberOrder) > 0 {
 			members := make([]interface{}, 0, len(memberOrder))
 			for _, id := range memberOrder {
-				members = append(members, memberByID[id])
+				if m, ok := memberByID[id]; ok {
+					members = append(members, m)
+				}
 			}
 			book["members"] = members
 		}

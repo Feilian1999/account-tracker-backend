@@ -99,7 +99,7 @@ func setupRouter() {
 			syncGrp.GET("/pull-uuid/:uuid", pullSyncByUUIDHandler)
 		}
 
-		// Public Shared Spaces — collaborative books identified by a 6-char code.
+		// Public Shared Spaces — collaborative books identified by an 8-char code (older 6-char codes still resolve).
 		sharedGrp := api.Group("/shared")
 		{
 			sharedGrp.POST("/share", shareBookHandler)       // Create a new share code

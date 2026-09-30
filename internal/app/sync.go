@@ -1,13 +1,18 @@
 package app
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // queued is one statement waiting to be pipelined, plus the table label used in
@@ -109,33 +114,48 @@ type SyncMember struct {
 	UserID string `json:"userId"`
 }
 
+// Optional fields added for multi-currency (migration 000003) follow one rule:
+// absent on push -> SQL NULL -> absent on pull. Nullable TEXT is a *string with
+// omitempty; frontend-owned JSON objects are a json.RawMessage with omitempty,
+// stored as JSONB and returned verbatim (see jsonbArg / jsonbValue).
+
 type SyncBook struct {
 	ID        string       `json:"id"`
 	Name      string       `json:"name"`
 	Members   []SyncMember `json:"members"`
 	CreatedAt string       `json:"createdAt"`
+	Currency  *string      `json:"currency,omitempty"`
 }
 
 type SyncRecord struct {
-	ID            string   `json:"id"`
-	BookID        string   `json:"bookId"`
-	Type          string   `json:"type"`
-	Amount        float64  `json:"amount"`
-	Category      string   `json:"category"`
-	Date          string   `json:"date"`
-	Note          string   `json:"note"`
-	PaidByID      string   `json:"paidById"`
-	SplitAmongIds []string `json:"splitAmongIds"`
+	ID                 string          `json:"id"`
+	BookID             string          `json:"bookId"`
+	Type               string          `json:"type"`
+	Amount             float64         `json:"amount"`
+	Category           string          `json:"category"`
+	Date               string          `json:"date"`
+	Note               string          `json:"note"`
+	PaidByID           string          `json:"paidById"`
+	SplitAmongIds      []string        `json:"splitAmongIds"`
+	SplitCustomAmounts json.RawMessage `json:"splitCustomAmounts,omitempty"`
+	AmountCurrency     *string         `json:"amountCurrency,omitempty"`
+	Original           json.RawMessage `json:"original,omitempty"`
+	Booked             json.RawMessage `json:"booked,omitempty"`
+	Fx                 json.RawMessage `json:"fx,omitempty"`
 }
 
 type SyncPersonalRecord struct {
-	ID           string  `json:"id"`
-	Type         string  `json:"type"`
-	Amount       float64 `json:"amount"`
-	Category     string  `json:"category"`
-	Date         string  `json:"date"`
-	Note         string  `json:"note"`
-	SourceBookID string  `json:"sourceBookId"`
+	ID             string          `json:"id"`
+	Type           string          `json:"type"`
+	Amount         float64         `json:"amount"`
+	Category       string          `json:"category"`
+	Date           string          `json:"date"`
+	Note           string          `json:"note"`
+	SourceBookID   string          `json:"sourceBookId"`
+	AmountCurrency *string         `json:"amountCurrency,omitempty"`
+	Original       json.RawMessage `json:"original,omitempty"`
+	Booked         json.RawMessage `json:"booked,omitempty"`
+	Fx             json.RawMessage `json:"fx,omitempty"`
 }
 
 type SyncCategory struct {
@@ -154,9 +174,16 @@ type SyncTemplate struct {
 	Amount   *float64 `json:"amount"`
 	Category string   `json:"category"`
 	Note     string   `json:"note"`
+	Currency *string  `json:"currency,omitempty"`
+}
+
+// SyncProfile is stored on the users row of the backup uuid.
+type SyncProfile struct {
+	BaseCurrency *string `json:"baseCurrency,omitempty"`
 }
 
 type SyncData struct {
+	Profile         *SyncProfile         `json:"profile,omitempty"`
 	Books           []SyncBook           `json:"books"`
 	Records         []SyncRecord         `json:"records"`
 	PersonalRecords []SyncPersonalRecord `json:"personal_records"`
@@ -164,10 +191,75 @@ type SyncData struct {
 	Templates       []SyncTemplate       `json:"templates"`
 }
 
+// isAbsentJSON reports whether an optional JSON field should be treated as
+// not sent: missing from the body (nil) or an explicit JSON null.
+func isAbsentJSON(raw json.RawMessage) bool {
+	return len(bytes.TrimSpace(raw)) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
+}
+
+// jsonbArg turns an optional JSON object field into a query argument: absent or
+// null becomes an untyped nil (SQL NULL), never the JSONB value 'null'. pgx
+// encodes a nil json.RawMessage as NULL, but a body containing `"fx": null`
+// decodes to the non-nil bytes "null", which pgx would store as JSONB null —
+// hence the explicit check.
+func jsonbArg(raw json.RawMessage) any {
+	if isAbsentJSON(raw) {
+		return nil
+	}
+	return string(raw)
+}
+
+// jsonbValue converts a scanned JSONB column back into an optional field:
+// SQL NULL (or a stray JSONB null) becomes nil so omitempty drops it.
+func jsonbValue(b []byte) json.RawMessage {
+	if isAbsentJSON(b) {
+		return nil
+	}
+	return json.RawMessage(b)
+}
+
+// checkJSONObject rejects an optional JSON field that is present but not an
+// object. The inner shape is deliberately not validated (the frontend owns it).
+func checkJSONObject(field string, raw json.RawMessage) error {
+	if isAbsentJSON(raw) {
+		return nil
+	}
+	if t := bytes.TrimSpace(raw); t[0] != '{' {
+		return fmt.Errorf("%s must be a JSON object", field)
+	}
+	return nil
+}
+
+// validateSyncJSON checks every opaque JSON field in a push body.
+func validateSyncJSON(records []SyncRecord, personal []SyncPersonalRecord) error {
+	for _, r := range records {
+		for _, f := range []struct {
+			name string
+			raw  json.RawMessage
+		}{{"splitCustomAmounts", r.SplitCustomAmounts}, {"original", r.Original}, {"booked", r.Booked}, {"fx", r.Fx}} {
+			if err := checkJSONObject("records["+r.ID+"]."+f.name, f.raw); err != nil {
+				return err
+			}
+		}
+	}
+	for _, r := range personal {
+		for _, f := range []struct {
+			name string
+			raw  json.RawMessage
+		}{{"original", r.Original}, {"booked", r.Booked}, {"fx", r.Fx}} {
+			if err := checkJSONObject("personal_records["+r.ID+"]."+f.name, f.raw); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func pushSyncByUUIDHandler(c *gin.Context) {
 	// Since SyncData is a struct, we manually bind to a wrapper
 	var wrapper struct {
 		UUID            string               `json:"uuid"`
+		Profile         *SyncProfile         `json:"profile"`
 		Books           []SyncBook           `json:"books"`
 		Records         []SyncRecord         `json:"records"`
 		PersonalRecords []SyncPersonalRecord `json:"personal_records"`
@@ -182,6 +274,11 @@ func pushSyncByUUIDHandler(c *gin.Context) {
 
 	if wrapper.UUID == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "UUID is required"})
+		return
+	}
+
+	if err := validateSyncJSON(wrapper.Records, wrapper.PersonalRecords); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
@@ -204,12 +301,19 @@ func pushSyncByUUIDHandler(c *gin.Context) {
 	// Everything below is queued and then pipelined in order — see execPipelined.
 	stmts := make([]queued, 0, 16+len(wrapper.Categories)+len(wrapper.Books)+len(wrapper.Records)+len(wrapper.PersonalRecords)+len(wrapper.Templates))
 
-	// Ensure the user row exists (create anonymous account on first backup).
+	// Ensure the user row exists (create anonymous account on first backup) and
+	// store the profile. Push is a full replace, so a push without
+	// profile.baseCurrency clears it to NULL.
 	// Done inside the transaction so a later failure does not leave an orphan user.
+	var baseCurrency *string
+	if wrapper.Profile != nil {
+		baseCurrency = wrapper.Profile.BaseCurrency
+	}
 	stmts = append(stmts, queued{"users", `
-		INSERT INTO users (id, name, email) VALUES ($1, $2, $3)
-		ON CONFLICT (id) DO NOTHING
-	`, []any{userID, "Anonymous", userID + "@anonymous.local"}})
+		INSERT INTO users (id, name, email, base_currency) VALUES ($1, $2, $3, $4)
+		ON CONFLICT (id) DO UPDATE SET
+			base_currency = EXCLUDED.base_currency
+	`, []any{userID, "Anonymous", userID + "@anonymous.local", baseCurrency}})
 
 	// Clear existing data — delete child tables first to avoid FK cascade issues.
 	// A failed clear must abort the whole push, otherwise stale rows would survive
@@ -245,13 +349,14 @@ func pushSyncByUUIDHandler(c *gin.Context) {
 	for _, book := range wrapper.Books {
 		createdAt := normalizeTimestamp(book.CreatedAt)
 		stmts = append(stmts, queued{"books", `
-			INSERT INTO books (id, user_id, name, created_at)
-			VALUES ($1, $2, $3, $4)
+			INSERT INTO books (id, user_id, name, created_at, currency)
+			VALUES ($1, $2, $3, $4, $5)
 			ON CONFLICT (id) DO UPDATE SET
 				name = EXCLUDED.name,
-				created_at = EXCLUDED.created_at
+				created_at = EXCLUDED.created_at,
+				currency = EXCLUDED.currency
 			WHERE books.user_id = $2
-		`, []any{book.ID, userID, book.Name, createdAt}})
+		`, []any{book.ID, userID, book.Name, createdAt, book.Currency}})
 
 		for _, m := range book.Members {
 			var mUserID *string
@@ -287,9 +392,10 @@ func pushSyncByUUIDHandler(c *gin.Context) {
 		}
 		date := normalizeDate(rec.Date)
 		stmts = append(stmts, queued{"records", `
-			INSERT INTO records (id, book_id, type, amount, category, date, note, paid_by_id, split_among_ids)
-			SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9
-			WHERE EXISTS (SELECT 1 FROM books WHERE id = $2 AND user_id = $10)
+			INSERT INTO records (id, book_id, type, amount, category, date, note, paid_by_id, split_among_ids,
+				split_custom_amounts, amount_currency, original, booked, fx)
+			SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14
+			WHERE EXISTS (SELECT 1 FROM books WHERE id = $2 AND user_id = $15)
 			ON CONFLICT (id) DO UPDATE SET
 				type = EXCLUDED.type,
 				amount = EXCLUDED.amount,
@@ -297,8 +403,14 @@ func pushSyncByUUIDHandler(c *gin.Context) {
 				date = EXCLUDED.date,
 				note = EXCLUDED.note,
 				paid_by_id = EXCLUDED.paid_by_id,
-				split_among_ids = EXCLUDED.split_among_ids
-		`, []any{rec.ID, rec.BookID, rec.Type, rec.Amount, rec.Category, date, rec.Note, paidByID, rec.SplitAmongIds, userID}})
+				split_among_ids = EXCLUDED.split_among_ids,
+				split_custom_amounts = EXCLUDED.split_custom_amounts,
+				amount_currency = EXCLUDED.amount_currency,
+				original = EXCLUDED.original,
+				booked = EXCLUDED.booked,
+				fx = EXCLUDED.fx
+		`, []any{rec.ID, rec.BookID, rec.Type, rec.Amount, rec.Category, date, rec.Note, paidByID, rec.SplitAmongIds,
+			jsonbArg(rec.SplitCustomAmounts), rec.AmountCurrency, jsonbArg(rec.Original), jsonbArg(rec.Booked), jsonbArg(rec.Fx), userID}})
 	}
 
 	// Personal Records
@@ -309,32 +421,39 @@ func pushSyncByUUIDHandler(c *gin.Context) {
 		}
 		date := normalizeDate(rec.Date)
 		stmts = append(stmts, queued{"personal_records", `
-			INSERT INTO personal_records (id, user_id, type, amount, category, date, note, source_book_id)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			INSERT INTO personal_records (id, user_id, type, amount, category, date, note, source_book_id,
+				amount_currency, original, booked, fx)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 			ON CONFLICT (id) DO UPDATE SET
 				type = EXCLUDED.type,
 				amount = EXCLUDED.amount,
 				category = EXCLUDED.category,
 				date = EXCLUDED.date,
 				note = EXCLUDED.note,
-				source_book_id = EXCLUDED.source_book_id
+				source_book_id = EXCLUDED.source_book_id,
+				amount_currency = EXCLUDED.amount_currency,
+				original = EXCLUDED.original,
+				booked = EXCLUDED.booked,
+				fx = EXCLUDED.fx
 			WHERE personal_records.user_id = $2
-		`, []any{rec.ID, userID, rec.Type, rec.Amount, rec.Category, date, rec.Note, sourceBookID}})
+		`, []any{rec.ID, userID, rec.Type, rec.Amount, rec.Category, date, rec.Note, sourceBookID,
+			rec.AmountCurrency, jsonbArg(rec.Original), jsonbArg(rec.Booked), jsonbArg(rec.Fx)}})
 	}
 
 	// Templates
 	for _, tpl := range wrapper.Templates {
 		stmts = append(stmts, queued{"record_templates", `
-			INSERT INTO record_templates (id, user_id, name, type, amount, category, note)
-			VALUES ($1, $2, $3, $4, $5, $6, $7)
+			INSERT INTO record_templates (id, user_id, name, type, amount, category, note, currency)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 			ON CONFLICT (id) DO UPDATE SET
 				name = EXCLUDED.name,
 				type = EXCLUDED.type,
 				amount = EXCLUDED.amount,
 				category = EXCLUDED.category,
-				note = EXCLUDED.note
+				note = EXCLUDED.note,
+				currency = EXCLUDED.currency
 			WHERE record_templates.user_id = $2
-		`, []any{tpl.ID, userID, tpl.Name, tpl.Type, tpl.Amount, tpl.Category, tpl.Note}})
+		`, []any{tpl.ID, userID, tpl.Name, tpl.Type, tpl.Amount, tpl.Category, tpl.Note, tpl.Currency}})
 	}
 
 	if table, err := execPipelined(ctx, tx, stmts); err != nil {
@@ -364,11 +483,19 @@ func pullSyncByUUIDHandler(c *gin.Context) {
 
 	ctx := c.Request.Context()
 
-	// Get Internal User ID
+	// Get Internal User ID (and the stored profile). "No such row" (or a
+	// malformed uuid, 22P02) is a 404; any other error is a read failure and
+	// must be a 500.
 	var userID string
-	err := dbPool.QueryRow(ctx, "SELECT id FROM users WHERE id = $1", uuid).Scan(&userID)
-	if err != nil {
+	var baseCurrency *string
+	err := dbPool.QueryRow(ctx, "SELECT id, base_currency FROM users WHERE id = $1", uuid).Scan(&userID, &baseCurrency)
+	var pgErr *pgconn.PgError
+	if errors.Is(err, pgx.ErrNoRows) || (errors.As(err, &pgErr) && pgErr.Code == "22P02") {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Backup not found for this UUID"})
+		return
+	}
+	if err != nil {
+		pullError(c, err)
 		return
 	}
 
@@ -378,6 +505,9 @@ func pullSyncByUUIDHandler(c *gin.Context) {
 		PersonalRecords: []SyncPersonalRecord{},
 		Categories:      []SyncCategory{},
 		Templates:       []SyncTemplate{},
+	}
+	if baseCurrency != nil {
+		data.Profile = &SyncProfile{BaseCurrency: baseCurrency}
 	}
 
 	// Fetch Categories
@@ -402,7 +532,7 @@ func pullSyncByUUIDHandler(c *gin.Context) {
 	}
 
 	// Fetch Books
-	rows, err = dbPool.Query(ctx, "SELECT id, name, created_at FROM books WHERE user_id = $1", userID)
+	rows, err = dbPool.Query(ctx, "SELECT id, name, created_at, currency FROM books WHERE user_id = $1", userID)
 	if err != nil {
 		pullError(c, err)
 		return
@@ -411,7 +541,7 @@ func pullSyncByUUIDHandler(c *gin.Context) {
 	for rows.Next() {
 		var item SyncBook
 		var createdAt time.Time
-		if err := rows.Scan(&item.ID, &item.Name, &createdAt); err != nil {
+		if err := rows.Scan(&item.ID, &item.Name, &createdAt, &item.Currency); err != nil {
 			rows.Close()
 			pullError(c, err)
 			return
@@ -453,7 +583,8 @@ func pullSyncByUUIDHandler(c *gin.Context) {
 
 	// Fetch Shared Records
 	rows, err = dbPool.Query(ctx, `
-		SELECT r.id, r.book_id, r.type, r.amount, r.category, r.date, r.note, COALESCE(r.paid_by_id::text, ''), r.split_among_ids
+		SELECT r.id, r.book_id, r.type, r.amount, r.category, r.date, r.note, COALESCE(r.paid_by_id::text, ''), r.split_among_ids,
+			r.split_custom_amounts, r.amount_currency, r.original, r.booked, r.fx
 		FROM records r
 		JOIN books b ON r.book_id = b.id
 		WHERE b.user_id = $1`, userID)
@@ -464,12 +595,18 @@ func pullSyncByUUIDHandler(c *gin.Context) {
 	for rows.Next() {
 		var item SyncRecord
 		var date time.Time
-		if err := rows.Scan(&item.ID, &item.BookID, &item.Type, &item.Amount, &item.Category, &date, &item.Note, &item.PaidByID, &item.SplitAmongIds); err != nil {
+		var splitCustom, original, booked, fx []byte
+		if err := rows.Scan(&item.ID, &item.BookID, &item.Type, &item.Amount, &item.Category, &date, &item.Note, &item.PaidByID, &item.SplitAmongIds,
+			&splitCustom, &item.AmountCurrency, &original, &booked, &fx); err != nil {
 			rows.Close()
 			pullError(c, err)
 			return
 		}
 		item.Date = date.Format("2006-01-02")
+		item.SplitCustomAmounts = jsonbValue(splitCustom)
+		item.Original = jsonbValue(original)
+		item.Booked = jsonbValue(booked)
+		item.Fx = jsonbValue(fx)
 		data.Records = append(data.Records, item)
 	}
 	rows.Close()
@@ -479,7 +616,10 @@ func pullSyncByUUIDHandler(c *gin.Context) {
 	}
 
 	// Fetch Personal Records
-	rows, err = dbPool.Query(ctx, "SELECT id, type, amount, category, date, note, COALESCE(source_book_id::text, '') FROM personal_records WHERE user_id = $1", userID)
+	rows, err = dbPool.Query(ctx, `
+		SELECT id, type, amount, category, date, note, COALESCE(source_book_id::text, ''),
+			amount_currency, original, booked, fx
+		FROM personal_records WHERE user_id = $1`, userID)
 	if err != nil {
 		pullError(c, err)
 		return
@@ -487,12 +627,17 @@ func pullSyncByUUIDHandler(c *gin.Context) {
 	for rows.Next() {
 		var item SyncPersonalRecord
 		var date time.Time
-		if err := rows.Scan(&item.ID, &item.Type, &item.Amount, &item.Category, &date, &item.Note, &item.SourceBookID); err != nil {
+		var original, booked, fx []byte
+		if err := rows.Scan(&item.ID, &item.Type, &item.Amount, &item.Category, &date, &item.Note, &item.SourceBookID,
+			&item.AmountCurrency, &original, &booked, &fx); err != nil {
 			rows.Close()
 			pullError(c, err)
 			return
 		}
 		item.Date = date.Format("2006-01-02")
+		item.Original = jsonbValue(original)
+		item.Booked = jsonbValue(booked)
+		item.Fx = jsonbValue(fx)
 		data.PersonalRecords = append(data.PersonalRecords, item)
 	}
 	rows.Close()
@@ -502,14 +647,14 @@ func pullSyncByUUIDHandler(c *gin.Context) {
 	}
 
 	// Fetch Templates
-	rows, err = dbPool.Query(ctx, "SELECT id, name, type, amount, category, note FROM record_templates WHERE user_id = $1", userID)
+	rows, err = dbPool.Query(ctx, "SELECT id, name, type, amount, category, note, currency FROM record_templates WHERE user_id = $1", userID)
 	if err != nil {
 		pullError(c, err)
 		return
 	}
 	for rows.Next() {
 		var item SyncTemplate
-		if err := rows.Scan(&item.ID, &item.Name, &item.Type, &item.Amount, &item.Category, &item.Note); err != nil {
+		if err := rows.Scan(&item.ID, &item.Name, &item.Type, &item.Amount, &item.Category, &item.Note, &item.Currency); err != nil {
 			rows.Close()
 			pullError(c, err)
 			return

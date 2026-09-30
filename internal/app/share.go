@@ -141,8 +141,9 @@ func updateSharedBookHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }
 
-// mergeSharedPayload merges an incoming {book, records, deletedIds} snapshot into
-// the existing {book, records} payload and returns the merged {book, records}.
+// mergeSharedPayload merges an incoming {book, records, deletedIds,
+// deletedMemberIds} snapshot into the existing {book, records} payload and
+// returns a new merged {book, records}; neither input map is modified.
 func mergeSharedPayload(existing, incoming map[string]interface{}) map[string]interface{} {
 	idOf := func(item interface{}) (string, bool) {
 		m, ok := item.(map[string]interface{})
@@ -195,12 +196,22 @@ func mergeSharedPayload(existing, incoming map[string]interface{}) map[string]in
 		}
 	}
 
-	// --- Book: take the incoming book, union members by id with the existing. ---
+	// --- Book: shallow field-level merge, then union members by id. ---
+	// Start from a copy of the stored book and overlay every key the incoming
+	// book carries (incoming wins for present keys). A key the pusher does not
+	// send is kept, so an older client that doesn't know e.g. book.currency
+	// cannot erase it. Copies only: the input maps are never mutated.
+	existingBook, _ := existing["book"].(map[string]interface{})
+	incomingBook, _ := incoming["book"].(map[string]interface{})
 	var book map[string]interface{}
-	if b, ok := incoming["book"].(map[string]interface{}); ok {
-		book = b
-	} else if b, ok := existing["book"].(map[string]interface{}); ok {
-		book = b
+	if existingBook != nil || incomingBook != nil {
+		book = make(map[string]interface{}, len(existingBook)+len(incomingBook))
+		for k, v := range existingBook {
+			book[k] = v
+		}
+		for k, v := range incomingBook {
+			book[k] = v
+		}
 	}
 	if book != nil {
 		memberByID := map[string]interface{}{}
@@ -217,10 +228,8 @@ func mergeSharedPayload(existing, incoming map[string]interface{}) map[string]in
 				memberByID[id] = it
 			}
 		}
-		if eb, ok := existing["book"].(map[string]interface{}); ok {
-			addMembers(asSlice(eb, "members"))
-		}
-		addMembers(asSlice(book, "members"))
+		addMembers(asSlice(existingBook, "members"))
+		addMembers(asSlice(incomingBook, "members"))
 
 		if deletedMembers, ok := incoming["deletedMemberIds"].([]interface{}); ok {
 			for _, d := range deletedMembers {

@@ -36,7 +36,7 @@ below. `tmp_server` in the repo root is a gitignored local build artifact.
 account-tracker-backend/
 ├── main.go                  # Standalone entry: app.GetRouter().Run(":$PORT")
 ├── api/index.go             # Vercel entry: Handler(w, r) → app.GetRouter().ServeHTTP()
-├── vercel.json              # rewrites /api/(.*) and /ping → /api/index.go
+├── vercel.json              # rewrites /api/:vpath* and /ping → /api/index.go?__vpath=<original path>
 ├── internal/
 │   ├── app/
 │   │   ├── app.go           # GetRouter (sync.Once): initDB (pool, ping, migrate) + routes
@@ -210,6 +210,22 @@ Sync = one transaction: `SELECT payload, doc, version … FOR UPDATE` → if `do
 
 - `book` = flatten(book) + `members` = every member flattened, sorted by `f.created` (string) then id — archived members included (they carry `archived: true`);
 - `records` = flattened records sorted by id, excluding those whose flattened `deleted` is `true` (those ids go to `deletedIds`); the `deleted` key is removed from every record.
+
+### Vercel rewrite path
+
+Vercel invokes the function at its own path (`/api/index.go`), not the path that
+was requested, so Gin would see the same path for every request and answer
+`404 page not found` everywhere (this took production down: even `/ping`
+404'd while the CORS preflight, handled before routing, still worked). The
+rewrites carry the original path as `__vpath` (and Vercel passes the named
+`vpath` parameter through on its own); `RestoreRewrittenPath` in
+`internal/app/vercel.go` puts it back before routing and strips both
+parameters. It lives in `app.ServeHTTP`, which BOTH entry points use — Vercel
+can run `main.go` as a Go server instead of calling `api/index.go`'s Handler
+(production did: the fix in `api/index.go` alone never ran). It must wrap the
+router, not be Gin middleware: Gin matches the route before middleware runs.
+Unknown paths get a JSON 404 that echoes the path the router saw. A new top-level
+route outside `/api/` needs its own rewrite with `__vpath`.
 
 ### Router singleton
 

@@ -1,6 +1,6 @@
 {
   "rewrites": [
-    { "source": "/api/(.*)", "destination": "/api/index.go" },
-    { "source": "/ping", "destination": "/api/index.go" }
+    { "source": "/api/:vpath*", "destination": "/api/index.go?__vpath=/api/:vpath*" },
+    { "source": "/ping", "destination": "/api/index.go?__vpath=/ping" }
   ]
 }

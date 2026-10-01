@@ -36,7 +36,7 @@ below. `tmp_server` in the repo root is a gitignored local build artifact.
 account-tracker-backend/
 ├── main.go                  # Standalone entry: app.GetRouter().Run(":$PORT")
 ├── api/index.go             # Vercel entry: Handler(w, r) → app.GetRouter().ServeHTTP()
-├── vercel.json              # rewrites /api/(.*) and /ping → /api/index.go
+├── vercel.json              # rewrites /api/:vpath* and /ping → /api/index.go?__vpath=<original path>
 ├── internal/
 │   ├── app/
 │   │   ├── app.go           # GetRouter (sync.Once): initDB (pool, ping, migrate) + routes
@@ -166,6 +166,18 @@ Pull = SELECT all rows for this UUID. Only a missing users row (or a malformed u
 - `book` is shallow-merged: a copy of the stored book with every key present in the incoming book overlaid (incoming wins for present keys, absent keys are kept — so an older client that doesn't know `book.currency` cannot erase it); then members are unioned by id with the stored ones, except ids in `deletedMemberIds`, which are removed. The merge never drops a member on its own, which is why the client must send `deletedMemberIds` explicitly. Records are not field-merged — clients preserve unknown record fields themselves. Input maps are never mutated.
 
 The merge is a read-then-UPDATE without a transaction or row lock, so two PUTs to the same code that interleave can still lose one side's changes (last writer wins on the merged result). A stored payload that fails to unmarshal is treated as empty. Share codes are 8 chars from a 32-symbol alphabet without `O/0/I/1` (~40 bits); on an insert collision it regenerates once. Codes are case-sensitive in the DB — the frontend uppercases before joining.
+
+### Vercel rewrite path
+
+Vercel invokes the function at its own path (`/api/index.go`), not the path that
+was requested, so Gin would see the same path for every request and answer
+`404 page not found` everywhere (this took production down: even `/ping`
+404'd while the CORS preflight, handled before routing, still worked). The
+rewrites carry the original path as `__vpath` (and Vercel passes the named
+`vpath` parameter through on its own); `RestoreRewrittenPath` in
+`internal/app/vercel.go`, called from `api/index.go`, puts it back before
+routing and strips both parameters. A no-op for `main.go`. A new top-level
+route outside `/api/` needs its own rewrite with `__vpath`.
 
 ### Router singleton
 

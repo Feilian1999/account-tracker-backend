@@ -3,6 +3,7 @@ package app
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -58,5 +59,22 @@ func TestRewrittenRequestReachesRoute(t *testing.T) {
 	r.ServeHTTP(after, req)
 	if after.Code != http.StatusOK || after.Body.String() != "pong" {
 		t.Fatalf("restored request should reach /ping, got %d %q", after.Code, after.Body.String())
+	}
+}
+
+// Both entry points (main.go's server and api/index.go) use ServeHTTP; with no
+// database it answers 500 "Database not connected" — i.e. it reached a route,
+// where the production bug produced a 404 for the function path.
+func TestServeHTTPRestoresBeforeRouting(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/index.go?__vpath=%2Fapi%2Fshared%2FZZZZZZZZ&vpath=shared%2FZZZZZZZZ", nil))
+	if rec.Code == http.StatusNotFound && strings.Contains(rec.Body.String(), "/api/index.go") {
+		t.Fatalf("still routed the function path: %d %s", rec.Code, rec.Body.String())
+	}
+	rec = httptest.NewRecorder()
+	ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/index.go?__vpath=%2Fping", nil))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "pong") {
+		t.Fatalf("/ping via rewrite: %d %s", rec.Code, rec.Body.String())
 	}
 }

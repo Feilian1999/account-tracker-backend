@@ -6,6 +6,5 @@ import (
 )
 
 func Handler(w http.ResponseWriter, r *http.Request) {
-	app.RestoreRewrittenPath(r)
-	app.GetRouter().ServeHTTP(w, r)
+	app.ServeHTTP(w, r)
 }

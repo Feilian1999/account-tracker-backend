@@ -44,3 +44,13 @@ func RestoreRewrittenPath(r *http.Request) {
 	r.URL.RawQuery = q.Encode()
 	r.RequestURI = r.URL.RequestURI()
 }
+
+// ServeHTTP is the entry for both deployments: it restores a rewritten path,
+// then routes. It must wrap the router rather than be Gin middleware, because
+// Gin matches the route before any middleware runs. Vercel may run either
+// api/index.go (serverless handler) or main.go (as a Go server) — both go
+// through here.
+func ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	RestoreRewrittenPath(r)
+	GetRouter().ServeHTTP(w, r)
+}

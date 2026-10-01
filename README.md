@@ -1,95 +1,78 @@
 # Account Tracker — Backend
 
-Go backend for [Account Tracker](../account-tracker). Handles Google OAuth, cloud data sync, and shared book collaboration.
+Go API for [Account Tracker](../account-tracker), an offline-first personal and
+shared expense tracker. It does two things:
 
-## Tech Stack
+- **Cloud backup** — a manual, full-replace backup of everything a user owns,
+  keyed by a secret UUID generated on the device. There are no accounts or
+  logins.
+- **Shared books** — books several people edit together, keyed by an 8-character
+  share code. The server merges each member's changes.
 
-- **Go 1.25** + **Gin v1.12**
-- **PostgreSQL** (Neon DB) via **pgx v5**
-- **golang-migrate v4** (auto-runs on startup)
-- **Google OAuth2** + **JWT** (`golang-jwt/jwt v5`)
-- **Vercel** serverless deployment (`api/index.go`)
+The frontend owns the data model; the backend stores and merges what it sends.
 
-## Getting Started
+## Stack
 
-### Prerequisites
+- Go 1.25, Gin, pgx v5
+- PostgreSQL (Neon)
+- golang-migrate (SQL embedded in the binary, applied on startup)
+- Deployed on Vercel with the Go framework preset
 
-- Go 1.25+
-- PostgreSQL instance (or [Neon DB](https://neon.tech) free tier)
-- Google Cloud project with OAuth 2.0 credentials
+## Running locally
 
-### Setup
+Requires Go 1.25+ and a PostgreSQL database.
 
 ```bash
-go mod download
+cat > .env <<'ENV'
+DATABASE_URL=postgresql://user:pass@host/dbname
+PORT=8080
+# CORS_ORIGINS=https://example.com   # optional extra allowed origins, comma-separated
+ENV
 
-cp .env.example .env
-# fill in .env (see below)
-
-go run main.go
-# server runs at http://localhost:8080
+go run main.go          # http://localhost:8080 — migrations run on startup
 ```
 
-### Environment Variables
+Without a reachable `DATABASE_URL` the server still starts; `/ping` reports
+`"db": "disconnected"` and data endpoints return 500.
 
-```env
-PORT=8080
-DATABASE_URL=postgresql://user:pass@host/dbname
-FRONTEND_URL=http://localhost:5173
-GOOGLE_CLIENT_ID=...
-GOOGLE_CLIENT_SECRET=...
-GOOGLE_REDIRECT_URI=http://localhost:8080/api/auth/google/callback
-JWT_SECRET=...
+```bash
+go build ./... && go vet ./...
+go test ./...           # unit tests, no database needed
+gofmt -l .              # must print nothing
 ```
 
 ## API
 
 ```
-GET  /ping
+GET  /ping                         health: {message, db, commit}
 
-# Auth
-GET  /api/auth/google/login
-GET  /api/auth/google/callback
+POST /api/sync/push-uuid           cloud backup (full replace)
+GET  /api/sync/pull-uuid/:uuid     restore
 
-# Cloud sync (JWT required)
-POST /api/sync/push
-GET  /api/sync/pull
-
-# UUID backup (no auth)
-POST /api/sync/push-uuid
-GET  /api/sync/pull-uuid/:uuid
-
-# Shared books (no auth)
-POST /api/shared/share
-GET  /api/shared/:code
-PUT  /api/shared/:code
+POST /api/shared/share             share a book → {code}
+GET  /api/shared/:code             fetch a shared book
+PUT  /api/shared/:code             merge changes into a shared book
 ```
 
-Push sync = full replace (DELETE all + INSERT all). Pull sync = return all user data. The frontend is always the source of truth when pushing.
+Request and response shapes, the merge rules and the database schema are in
+[`CLAUDE.md`](CLAUDE.md).
 
-## Project Structure
+## Deployment
+
+Pushing to `main` deploys to production on Vercel. `vercel.json` only selects the
+Go framework preset: Vercel builds `main.go` and runs it as a server on `PORT`,
+passing every request at its real path. Set `DATABASE_URL` (and optionally
+`CORS_ORIGINS`) in the Vercel project. Migrations in
+`internal/db/migrations/` are applied automatically on the next start.
+
+## Project structure
 
 ```
-account-tracker-backend/
-├── main.go                          # Standalone dev entry point
-├── api/index.go                     # Vercel serverless entry point
-├── internal/
-│   ├── app/
-│   │   ├── app.go                   # Router setup, DB init, route registration
-│   │   ├── sync.go                  # Sync push/pull handlers
-│   │   └── share.go                 # Shared book handlers
-│   ├── auth/
-│   │   ├── google.go                # Google OAuth flow
-│   │   └── jwt.go                   # JWT generation & validation
-│   ├── db/
-│   │   ├── migrate.go               # Migration runner
-│   │   └── migrations/              # SQL migration files
-│   └── middleware/
-│       └── auth_middleware.go       # JWT validation middleware
-└── .env / .env.example
+main.go                     entry point (local and Vercel)
+internal/app/               router, handlers (backup in sync.go, shared books in share.go)
+internal/db/                migration runner + SQL migrations
+internal/middleware/        CORS allowlist (web + Capacitor origins)
 ```
-
-See [`CLAUDE.md`](CLAUDE.md) for full architectural details including DB schema and key patterns.
 
 ## License
 

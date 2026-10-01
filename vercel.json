@@ -1,6 +1,4 @@
 {
-  "rewrites": [
-    { "source": "/api/:vpath*", "destination": "/api/index.go?__vpath=/api/:vpath*" },
-    { "source": "/ping", "destination": "/api/index.go?__vpath=/ping" }
-  ]
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "go"
 }

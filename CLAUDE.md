@@ -15,7 +15,7 @@ frontend sends — the frontend owns the data model (see its `CLAUDE.md`).
 - **Database**: PostgreSQL (Neon) via pgx v5 (`pgxpool`)
 - **Migrations**: golang-migrate v4, SQL embedded with `//go:embed`, auto-run on startup
 - **Auth**: None. Backup is keyed by a secret client UUID; shared books by a share code.
-- **Deploy**: Vercel serverless (`api/index.go`) or standalone (`main.go`)
+- **Deploy**: Vercel Go framework preset — runs `main.go` as a server (see Deployment)
 
 ## Commands
 
@@ -35,8 +35,7 @@ below. `tmp_server` in the repo root is a gitignored local build artifact.
 ```
 account-tracker-backend/
 ├── main.go                  # Standalone entry: app.GetRouter().Run(":$PORT")
-├── api/index.go             # Vercel entry: Handler(w, r) → app.GetRouter().ServeHTTP()
-├── vercel.json              # rewrites /api/:vpath* and /ping → /api/index.go?__vpath=<original path>
+├── vercel.json              # {"framework": "go"} — nothing else
 ├── internal/
 │   ├── app/
 │   │   ├── app.go           # GetRouter (sync.Once): initDB (pool, ping, migrate) + routes
@@ -167,25 +166,18 @@ Pull = SELECT all rows for this UUID. Only a missing users row (or a malformed u
 
 The merge is a read-then-UPDATE without a transaction or row lock, so two PUTs to the same code that interleave can still lose one side's changes (last writer wins on the merged result). A stored payload that fails to unmarshal is treated as empty. Share codes are 8 chars from a 32-symbol alphabet without `O/0/I/1` (~40 bits); on an insert collision it regenerates once. Codes are case-sensitive in the DB — the frontend uppercases before joining.
 
-### Vercel rewrite path
+### Deployment
 
-Vercel invokes the function at its own path (`/api/index.go`), not the path that
-was requested, so Gin would see the same path for every request and answer
-`404 page not found` everywhere (this took production down: even `/ping`
-404'd while the CORS preflight, handled before routing, still worked). The
-rewrites carry the original path as `__vpath` (and Vercel passes the named
-`vpath` parameter through on its own); `RestoreRewrittenPath` in
-`internal/app/vercel.go` puts it back before routing and strips both
-parameters. It lives in `app.ServeHTTP`, which BOTH entry points use — Vercel
-can run `main.go` as a Go server instead of calling `api/index.go`'s Handler
-(production did: the fix in `api/index.go` alone never ran). It must wrap the
-router, not be Gin middleware: Gin matches the route before middleware runs.
-Unknown paths get a JSON 404 that echoes the path the router saw. A new top-level
-route outside `/api/` needs its own rewrite with `__vpath`.
+The only entry point is `main.go`, locally and on Vercel. `vercel.json` sets the
+Go framework preset, which builds the module and runs the server (listening on
+`PORT`), handing it every request at its real path — so no rewrites, no `api/`
+functions. Don't reintroduce either: a rewrite to a function path makes the
+server see that path for every request, which once 404'd every route in
+production (even `/ping`, while the CORS preflight still answered).
 
 ### Router singleton
 
-`GetRouter()` uses `sync.Once` — safe for both Vercel (cold start per instance) and standalone. The pgx pool is capped at `MaxConns=2` because every serverless instance owns its own pool and Neon's connection limit is shared; migrations open and close their own connection (`pgx5://` scheme is swapped in by `initDB`).
+`GetRouter()` uses `sync.Once` (DB init + routes, once per process). The pgx pool is capped at `MaxConns=2` because Vercel may run several server instances, each with its own pool, against Neon's shared connection limit; migrations open and close their own connection (`pgx5://` scheme is swapped in by `initDB`).
 
 ### CORS
 

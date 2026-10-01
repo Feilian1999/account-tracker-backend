@@ -73,6 +73,19 @@ func setupRouter() {
 	// CORS Middleware
 	r.Use(middleware.CORS())
 
+	// JSON 404 that says which path the router actually saw. Behind Vercel's
+	// rewrite the function can be invoked with a different path than the one
+	// requested (see vercel.go); this makes that visible instead of Gin's bare
+	// "404 page not found". Path and query only — no headers or client data.
+	r.NoRoute(func(c *gin.Context) {
+		c.JSON(http.StatusNotFound, gin.H{
+			"error": "not found",
+			"path":  c.Request.URL.Path,
+			"query": c.Request.URL.RawQuery,
+			"uri":   c.Request.RequestURI,
+		})
+	})
+
 	r.GET("/ping", func(c *gin.Context) {
 		dbStatus := "connected"
 		if dbPool == nil {

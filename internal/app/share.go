@@ -3,11 +3,13 @@ package app
 import (
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"math/big"
 	"net/http"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/jackc/pgx/v5"
 )
 
 // Generate a random 8-character alphanumeric code.
@@ -89,13 +91,12 @@ func getSharedBookHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, payload)
 }
 
-// updateSharedBookHandler merges the pusher's snapshot into the stored payload
-// instead of blindly overwriting it. Without this, two members editing the same
-// book concurrently would clobber each other's records (last-write-wins on the
-// whole blob). Records are merged by id (incoming wins), explicit deletedIds are
-// removed, and book members are unioned by id so a concurrently-added member is
-// not lost — except ids listed in deletedMemberIds, which are removed same as
-// deletedIds for records.
+// updateSharedBookHandler (v1 PUT) merges the pusher's snapshot into the
+// stored payload instead of blindly overwriting it (see mergeSharedPayload).
+// The read-merge-write runs in one transaction under a row lock (SELECT … FOR
+// UPDATE) so concurrent PUTs cannot lose each other's changes. A space that has
+// been upgraded to v2 (doc IS NOT NULL) is read-only for v1: 409
+// upgrade_required, nothing written.
 func updateSharedBookHandler(c *gin.Context) {
 	code := c.Param("code")
 
@@ -112,13 +113,29 @@ func updateSharedBookHandler(c *gin.Context) {
 
 	ctx := c.Request.Context()
 
-	// Load the existing payload (if any).
-	var existingRaw []byte
-	err := dbPool.QueryRow(ctx, "SELECT payload FROM shared_spaces WHERE code = $1", code).Scan(&existingRaw)
+	tx, err := dbPool.Begin(ctx)
 	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start transaction"})
+		return
+	}
+	// No-op after a successful Commit; releases the row lock on every other path.
+	defer tx.Rollback(ctx)
+
+	var existingRaw, docRaw []byte
+	err = tx.QueryRow(ctx, "SELECT payload, doc FROM shared_spaces WHERE code = $1 FOR UPDATE", code).Scan(&existingRaw, &docRaw)
+	if errors.Is(err, pgx.ErrNoRows) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Shared book not found"})
 		return
 	}
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to read shared book"})
+		return
+	}
+	if !isAbsentJSON(docRaw) {
+		c.JSON(http.StatusConflict, gin.H{"error": "upgrade_required"})
+		return
+	}
+
 	var existing map[string]interface{}
 	if len(existingRaw) > 0 {
 		_ = json.Unmarshal(existingRaw, &existing)
@@ -126,15 +143,14 @@ func updateSharedBookHandler(c *gin.Context) {
 
 	merged := mergeSharedPayload(existing, incoming)
 
-	res, err := dbPool.Exec(ctx,
+	if _, err := tx.Exec(ctx,
 		"UPDATE shared_spaces SET payload = $1, updated_at = $2 WHERE code = $3",
-		merged, time.Now(), code)
-	if err != nil {
+		merged, time.Now(), code); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update shared book"})
 		return
 	}
-	if res.RowsAffected() == 0 {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Shared book not found"})
+	if err := tx.Commit(ctx); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to commit transaction"})
 		return
 	}
 
@@ -142,8 +158,12 @@ func updateSharedBookHandler(c *gin.Context) {
 }
 
 // mergeSharedPayload merges an incoming {book, records, deletedIds,
-// deletedMemberIds} snapshot into the existing {book, records} payload and
-// returns a new merged {book, records}; neither input map is modified.
+// deletedMemberIds} snapshot into the existing {book, records, deletedIds,
+// deletedMemberIds} payload and returns a new merged payload of the same shape;
+// neither input map is modified. Tombstones are persistent: the result's
+// deletedIds / deletedMemberIds are the union of stored and incoming, and any
+// record / member whose id is tombstoned is dropped — including ones in the
+// incoming snapshot, so a stale client cannot resurrect them.
 func mergeSharedPayload(existing, incoming map[string]interface{}) map[string]interface{} {
 	idOf := func(item interface{}) (string, bool) {
 		m, ok := item.(map[string]interface{})
@@ -163,7 +183,24 @@ func mergeSharedPayload(existing, incoming map[string]interface{}) map[string]in
 		return nil
 	}
 
-	// --- Merge records by id (incoming wins), then drop deletedIds. ---
+	// --- Tombstones: union of stored and incoming (stored order first). ---
+	unionIDs := func(key string) ([]interface{}, map[string]bool) {
+		set := map[string]bool{}
+		list := []interface{}{}
+		for _, src := range []map[string]interface{}{existing, incoming} {
+			for _, d := range asSlice(src, key) {
+				if id, ok := d.(string); ok && id != "" && !set[id] {
+					set[id] = true
+					list = append(list, id)
+				}
+			}
+		}
+		return list, set
+	}
+	deletedIDs, deletedSet := unionIDs("deletedIds")
+	deletedMemberIDs, deletedMemberSet := unionIDs("deletedMemberIds")
+
+	// --- Merge records by id (incoming wins), then drop tombstoned ids. ---
 	recordByID := map[string]interface{}{}
 	order := []string{}
 	appendRecords := func(items []interface{}) {
@@ -181,12 +218,8 @@ func mergeSharedPayload(existing, incoming map[string]interface{}) map[string]in
 	appendRecords(asSlice(existing, "records"))
 	appendRecords(asSlice(incoming, "records"))
 
-	if deleted, ok := incoming["deletedIds"].([]interface{}); ok {
-		for _, d := range deleted {
-			if id, ok := d.(string); ok {
-				delete(recordByID, id)
-			}
-		}
+	for id := range deletedSet {
+		delete(recordByID, id)
 	}
 
 	records := make([]interface{}, 0, len(order))
@@ -231,12 +264,8 @@ func mergeSharedPayload(existing, incoming map[string]interface{}) map[string]in
 		addMembers(asSlice(existingBook, "members"))
 		addMembers(asSlice(incomingBook, "members"))
 
-		if deletedMembers, ok := incoming["deletedMemberIds"].([]interface{}); ok {
-			for _, d := range deletedMembers {
-				if id, ok := d.(string); ok {
-					delete(memberByID, id)
-				}
-			}
+		for id := range deletedMemberSet {
+			delete(memberByID, id)
 		}
 
 		if len(memberOrder) > 0 {
@@ -251,7 +280,9 @@ func mergeSharedPayload(existing, incoming map[string]interface{}) map[string]in
 	}
 
 	return map[string]interface{}{
-		"book":    book,
-		"records": records,
+		"book":             book,
+		"records":          records,
+		"deletedIds":       deletedIDs,
+		"deletedMemberIds": deletedMemberIDs,
 	}
 }

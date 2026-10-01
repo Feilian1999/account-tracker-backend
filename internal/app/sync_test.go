@@ -96,3 +96,19 @@ func TestSyncStructsOptionalFieldsRoundTrip(t *testing.T) {
 		t.Errorf("book without currency must omit it: %s", out)
 	}
 }
+
+func TestSyncMemberArchivedRoundTrip(t *testing.T) {
+	for _, s := range []string{
+		`{"id":"m1","name":"A","userId":""}`,
+		`{"id":"m1","name":"A","userId":"","archived":true}`,
+		`{"id":"m1","name":"A","userId":"","archived":false}`,
+	} {
+		var m SyncMember
+		if err := json.Unmarshal([]byte(s), &m); err != nil {
+			t.Fatal(err)
+		}
+		if out, _ := json.Marshal(m); string(out) != s {
+			t.Errorf("round trip mismatch:\n got %s\nwant %s", out, s)
+		}
+	}
+}

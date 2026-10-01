@@ -102,9 +102,20 @@ func setupRouter() {
 		// Public Shared Spaces — collaborative books identified by an 8-char code (older 6-char codes still resolve).
 		sharedGrp := api.Group("/shared")
 		{
+			// v1: whole-snapshot merge (legacy clients). PUT 409s once a space is upgraded to v2.
 			sharedGrp.POST("/share", shareBookHandler)       // Create a new share code
 			sharedGrp.GET("/:code", getSharedBookHandler)    // Fetch book by code
 			sharedGrp.PUT("/:code", updateSharedBookHandler) // Merge book by code
+
+			// v2: CRDT doc sync. The static "v2" segment coexists with v1's
+			// "/:code" wildcard (Gin ≥1.8 prefers static children); share codes
+			// are uppercase, so no real code can be "v2". Covered by router_test.go.
+			v2 := sharedGrp.Group("/v2")
+			{
+				v2.POST("", createSharedV2Handler)          // Create a v2 space
+				v2.GET("/:code", getSharedV2Handler)        // Doc changes since ?since=N
+				v2.POST("/:code/sync", syncSharedV2Handler) // Merge changes, return changes since N
+			}
 		}
 	}
 

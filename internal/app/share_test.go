@@ -148,8 +148,48 @@ func TestMergeNilExisting(t *testing.T) {
 	if got := idsOf(t, merged["records"]); !reflect.DeepEqual(got, []string{"r1"}) {
 		t.Errorf("records = %v, want [r1]", got)
 	}
-	if _, ok := merged["deletedIds"]; ok {
-		t.Error("deletedIds must not be stored in the merged payload")
+	if got := merged["deletedIds"]; !reflect.DeepEqual(got, []interface{}{"zz"}) {
+		t.Errorf("deletedIds = %#v, want [zz] (tombstones are persisted)", got)
+	}
+	if got := merged["deletedMemberIds"]; !reflect.DeepEqual(got, []interface{}{}) {
+		t.Errorf("deletedMemberIds = %#v, want []", got)
+	}
+}
+
+// A record / member deleted by one client must stay deleted when a stale
+// client later pushes a snapshot that still contains it (no resurrection).
+func TestMergeTombstonesAccumulateAndBlockResurrection(t *testing.T) {
+	stored := payload(t, `{"book":{"id":"b1","members":[{"id":"m1"},{"id":"m2"}]},"records":[{"id":"r1"},{"id":"r2"}]}`)
+
+	// Client A deletes r1 and m2.
+	afterA := mergeSharedPayload(stored, payload(t, `{"book":{"id":"b1","members":[{"id":"m1"}]},"records":[{"id":"r2"}],"deletedIds":["r1"],"deletedMemberIds":["m2"]}`))
+	// Round-trip through JSON like the DB does.
+	b, _ := json.Marshal(afterA)
+	afterA = payload(t, string(b))
+
+	// Stale client B still has r1 and m2, knows no tombstones, deletes r2.
+	afterB := mergeSharedPayload(afterA, payload(t, `{"book":{"id":"b1","members":[{"id":"m1"},{"id":"m2"}]},"records":[{"id":"r1"},{"id":"r3"}],"deletedIds":["r2"]}`))
+
+	if got := idsOf(t, afterB["records"]); !reflect.DeepEqual(got, []string{"r3"}) {
+		t.Errorf("records = %v, want [r3]", got)
+	}
+	if got := idsOf(t, bookOf(t, afterB)["members"]); !reflect.DeepEqual(got, []string{"m1"}) {
+		t.Errorf("members = %v, want [m1]", got)
+	}
+	if got := afterB["deletedIds"]; !reflect.DeepEqual(got, []interface{}{"r1", "r2"}) {
+		t.Errorf("deletedIds = %#v, want [r1 r2]", got)
+	}
+	if got := afterB["deletedMemberIds"]; !reflect.DeepEqual(got, []interface{}{"m2"}) {
+		t.Errorf("deletedMemberIds = %#v, want [m2]", got)
+	}
+
+	// A third push with no book and no tombstones keeps everything.
+	afterC := mergeSharedPayload(afterB, payload(t, `{"records":[{"id":"r1"}]}`))
+	if got := idsOf(t, afterC["records"]); !reflect.DeepEqual(got, []string{"r3"}) {
+		t.Errorf("records = %v, want [r3]", got)
+	}
+	if got := afterC["deletedMemberIds"]; !reflect.DeepEqual(got, []interface{}{"m2"}) {
+		t.Errorf("deletedMemberIds = %#v, want [m2]", got)
 	}
 }
 

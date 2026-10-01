@@ -109,9 +109,10 @@ func normalizeDate(d string) string {
 }
 
 type SyncMember struct {
-	ID     string `json:"id"`
-	Name   string `json:"name"`
-	UserID string `json:"userId"`
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	UserID   string `json:"userId"`
+	Archived *bool  `json:"archived,omitempty"` // migration 000004; absent -> NULL -> absent
 }
 
 // Optional fields added for multi-currency (migration 000003) follow one rule:
@@ -373,14 +374,15 @@ func pushSyncByUUIDHandler(c *gin.Context) {
 
 			// Guard: only write members into a book that this user owns.
 			stmts = append(stmts, queued{"book_members", `
-				INSERT INTO book_members (id, book_id, name, user_id)
-				SELECT $1, $2, $3, $4
+				INSERT INTO book_members (id, book_id, name, user_id, archived)
+				SELECT $1, $2, $3, $4, $6::boolean
 				WHERE EXISTS (SELECT 1 FROM books WHERE id = $2 AND user_id = $5)
 				ON CONFLICT (id) DO UPDATE SET
 					name = EXCLUDED.name,
 					book_id = EXCLUDED.book_id,
-					user_id = EXCLUDED.user_id
-			`, []any{m.ID, book.ID, m.Name, mUserID, userID}})
+					user_id = EXCLUDED.user_id,
+					archived = EXCLUDED.archived
+			`, []any{m.ID, book.ID, m.Name, mUserID, userID, m.Archived}})
 		}
 	}
 
@@ -559,14 +561,14 @@ func pullSyncByUUIDHandler(c *gin.Context) {
 	// Fetch Members for each book (after the books cursor is closed, to avoid
 	// holding two pooled connections at once).
 	for i := range books {
-		mRows, err := dbPool.Query(ctx, "SELECT id, name, COALESCE(user_id::text, '') FROM book_members WHERE book_id = $1", books[i].ID)
+		mRows, err := dbPool.Query(ctx, "SELECT id, name, COALESCE(user_id::text, ''), archived FROM book_members WHERE book_id = $1", books[i].ID)
 		if err != nil {
 			pullError(c, err)
 			return
 		}
 		for mRows.Next() {
 			var m SyncMember
-			if err := mRows.Scan(&m.ID, &m.Name, &m.UserID); err != nil {
+			if err := mRows.Scan(&m.ID, &m.Name, &m.UserID, &m.Archived); err != nil {
 				mRows.Close()
 				pullError(c, err)
 				return
